@@ -5,7 +5,7 @@
     {% if athlete_name %}
         <a href="{{ url_for('athlete_profile', athlete_name=athlete_name) }}" class="btn btn-secondary">Back to Profile</a>
     {% else %}
-        <a href="{{ url_for('index') }}" class="btn btn-secondary">Back to Home</a>
+        <a href="{{ url_for('athletes') }}" class="btn btn-secondary">Back to Athletes</a>
     {% endif %}
 </div>
 <form method="post" action="{{ url_for('select_activity') }}" id="select-activity-form">

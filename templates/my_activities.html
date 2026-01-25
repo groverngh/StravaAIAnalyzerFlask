@@ -1,0 +1,25 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h2>My Activities</h2>
+    <a href="{{ url_for('athletes') }}" class="btn btn-secondary">Back to Athletes</a>
+</div>
+<form method="post">
+    <div class="mb-3" onclick="if(document.getElementById('date').showPicker){document.getElementById('date').showPicker();}else{document.getElementById('date').focus();}">
+        <label for="date" class="form-label">Date (or start date)</label>
+        <input type="date" class="form-control" id="date" name="date" required onchange="this.blur();">
+    </div>
+    <div class="mb-3" onclick="if(document.getElementById('end_date').showPicker){document.getElementById('end_date').showPicker();}else{document.getElementById('end_date').focus();}">
+        <label for="end_date" class="form-label">End Date (optional)</label>
+        <input type="date" class="form-control" id="end_date" name="end_date" onchange="this.blur();">
+    </div>
+    <div class="mb-3">
+        <label for="analysis_query" class="form-label">What do you want to analyze? (optional)</label>
+        <input type="text" class="form-control" id="analysis_query" name="analysis_query" placeholder="e.g. performance, heart rate, calories">
+    </div>
+    <button type="submit" class="btn btn-primary">Fetch Activities</button>
+</form>
+{% if error %}
+<div class="alert alert-danger mt-3">{{ error }}</div>
+{% endif %}
+{% endblock %}

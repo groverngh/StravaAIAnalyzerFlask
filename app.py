@@ -296,8 +296,14 @@ def get_athlete_token(athlete_name):
 
     return creds['access_token']
 
-@app.route('/', methods=['GET', 'POST'])
+@app.route('/')
 def index():
+    """Main landing page - Athlete Summary"""
+    return redirect(url_for('athletes'))
+
+@app.route('/my-activities', methods=['GET', 'POST'])
+def my_activities():
+    """Personal Strava activity analyzer"""
     if request.method == 'POST':
         date = request.form['date']
         end_date = request.form.get('end_date', '').strip()
@@ -323,7 +329,7 @@ def index():
         }
         auth_url = f"https://www.strava.com/oauth/authorize?{urlencode(params)}"
         return redirect(auth_url)
-    return render_template('index.html')
+    return render_template('my_activities.html')
 
 @app.route('/callback')
 def callback():
@@ -346,7 +352,7 @@ def callback():
     expires_at = token_data.get('expires_at')
 
     if not access_token or not refresh_token:
-        return render_template('index.html', error='Failed to get Strava access token.')
+        return render_template('my_activities.html', error='Failed to get Strava access token.')
 
     # Save tokens persistently
     save_tokens(access_token, refresh_token, expires_at)
@@ -390,7 +396,7 @@ def fetch_activities():
         if 'moving_time' in act and act.get('distance_miles', 0) > 0:
             act['pace_min_per_mile'] = round((act['moving_time'] / 60) / act['distance_miles'], 2)
     if not activities:
-        return render_template('index.html', error='No activities found for this date range.')
+        return render_template('my_activities.html', error='No activities found for this date range.')
     if len(activities) == 1:
         return redirect(url_for('activity_detail', activity_id=activities[0]['id']))
     return render_template('select.html', activities=activities, analysis_query=analysis_query)
@@ -757,7 +763,8 @@ def fetch_athlete_activities(athlete_name):
     if end_date:
         end_dt = datetime.strptime(end_date, '%Y-%m-%d')
     else:
-        end_dt = start_dt
+        # Default to today if end_date not provided
+        end_dt = datetime.now()
 
     after = int(start_dt.replace(hour=0, minute=0, second=0).timestamp())
     before = int(end_dt.replace(hour=23, minute=59, second=59).timestamp())
