@@ -1,0 +1,51 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h2>{{ athlete_name }}</h2>
+    <a href="{{ url_for('athletes') }}" class="btn btn-secondary">Back to Athletes</a>
+</div>
+
+{% if athlete %}
+<div class="card mb-4">
+    <div class="card-body">
+        <h5 class="card-title">Athlete Summary</h5>
+        <div class="row">
+            <div class="col-md-4">
+                <strong>Yearly Distance:</strong> {{ "%.2f"|format(athlete.yearly_distance) }} miles
+            </div>
+            <div class="col-md-4">
+                <strong>Number of Runs:</strong> {{ athlete.number_of_runs }}
+            </div>
+            <div class="col-md-4">
+                <strong>Current Week:</strong> {{ "%.2f"|format(athlete.current_week|float) if athlete.current_week else '0.00' }} miles
+            </div>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+<div class="card">
+    <div class="card-body">
+        <h5 class="card-title">Fetch Activities</h5>
+        <form method="post" action="{{ url_for('fetch_athlete_activities', athlete_name=athlete_name) }}">
+            <div class="mb-3" onclick="if(document.getElementById('date').showPicker){document.getElementById('date').showPicker();}else{document.getElementById('date').focus();}">
+                <label for="date" class="form-label">Date (or start date)</label>
+                <input type="date" class="form-control" id="date" name="date" required onchange="this.blur();">
+            </div>
+            <div class="mb-3" onclick="if(document.getElementById('end_date').showPicker){document.getElementById('end_date').showPicker();}else{document.getElementById('end_date').focus();}">
+                <label for="end_date" class="form-label">End Date (optional)</label>
+                <input type="date" class="form-control" id="end_date" name="end_date" onchange="this.blur();">
+            </div>
+            <div class="mb-3">
+                <label for="analysis_query" class="form-label">What do you want to analyze? (optional)</label>
+                <input type="text" class="form-control" id="analysis_query" name="analysis_query" placeholder="e.g. performance, heart rate, calories">
+            </div>
+            <button type="submit" class="btn btn-primary">Fetch Activities</button>
+        </form>
+    </div>
+</div>
+
+{% if error %}
+<div class="alert alert-danger mt-3">{{ error }}</div>
+{% endif %}
+{% endblock %}

@@ -1,6 +1,13 @@
 {% extends 'base.html' %}
 {% block content %}
-<h2>Select an Activity to Analyze</h2>
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h2>Select an Activity to Analyze{% if athlete_name %} - {{ athlete_name }}{% endif %}</h2>
+    {% if athlete_name %}
+        <a href="{{ url_for('athlete_profile', athlete_name=athlete_name) }}" class="btn btn-secondary">Back to Profile</a>
+    {% else %}
+        <a href="{{ url_for('index') }}" class="btn btn-secondary">Back to Home</a>
+    {% endif %}
+</div>
 <form method="post" action="{{ url_for('select_activity') }}" id="select-activity-form">
     <ul class="list-group mb-3">
         {% for act in activities %}

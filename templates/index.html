@@ -1,6 +1,9 @@
 {% extends 'base.html' %}
 {% block content %}
-<h2>Strava AI Analyzer</h2>
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h2>Strava AI Analyzer</h2>
+    <a href="{{ url_for('athletes') }}" class="btn btn-info">View Athlete Summary</a>
+</div>
 <form method="post">
     <div class="mb-3" onclick="if(document.getElementById('date').showPicker){document.getElementById('date').showPicker();}else{document.getElementById('date').focus();}">
         <label for="date" class="form-label">Date (or start date)</label>

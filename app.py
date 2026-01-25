@@ -8,6 +8,8 @@ from urllib.parse import urlencode
 import markdown2
 import json
 import time
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 load_dotenv()
 
@@ -22,6 +24,10 @@ STRAVA_CLIENT_SECRET = os.getenv('STRAVA_CLIENT_SECRET')
 STRAVA_REDIRECT_URI = os.getenv('STRAVA_REDIRECT_URI', 'http://localhost:4200/callback')
 OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4')
 TOKEN_FILE = 'token_store.json'
+GOOGLE_SHEETS_CREDENTIALS_FILE = 'njmaniacs-485422-8e16104bb447.json'
+GOOGLE_SHEET_ID = '1POa75jrHHYwyfBAC0aObgc01HEFPnjl7ongLAJhqfa0'
+GOOGLE_SHEET_NAME = 'Sheet1'
+ATHLETE_CREDS_SHEET_NAME = 'Athelete'
 
 # Token management functions
 def save_tokens(access_token, refresh_token, expires_at):
@@ -95,6 +101,200 @@ def get_token():
         return token
 
     return None
+
+# Google Sheets functions
+def get_sheets_service(readonly=True):
+    """Get authenticated Google Sheets service"""
+    scope = ['https://www.googleapis.com/auth/spreadsheets.readonly'] if readonly else ['https://www.googleapis.com/auth/spreadsheets']
+    creds = service_account.Credentials.from_service_account_file(
+        GOOGLE_SHEETS_CREDENTIALS_FILE,
+        scopes=scope
+    )
+    return build('sheets', 'v4', credentials=creds)
+
+def get_athletes_data():
+    """Fetch athlete data from Google Sheets"""
+    try:
+        service = get_sheets_service(readonly=True)
+
+        # Fetch data from the sheet
+        sheet = service.spreadsheets()
+        result = sheet.values().get(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            range=f'{GOOGLE_SHEET_NAME}!A:Z'  # Get all columns
+        ).execute()
+
+        values = result.get('values', [])
+        if not values:
+            return []
+
+        # First row is headers
+        headers = values[0]
+        data = []
+
+        # Debug: Print actual headers found
+        print(f"DEBUG: Found headers in Google Sheet: {headers}")
+
+        # Find column indices
+        try:
+            athlete_idx = headers.index('Athelete')  # Note: Column is spelled 'Athelete' in the sheet
+            distance_idx = headers.index('Total Distance(miles)')
+            runs_idx = headers.index('Number of Runs')
+            weekly_vol_idx = headers.index('WeeklyVolGen')
+        except ValueError as e:
+            print(f"ERROR - Column not found: {e}")
+            print(f"Available columns: {headers}")
+            return []
+
+        # Process each row
+        for row in values[1:]:  # Skip header row
+            if len(row) > max(athlete_idx, distance_idx, runs_idx, weekly_vol_idx):
+                # Get the last value from WeeklyVolGen (comma-separated)
+                weekly_vol_value = row[weekly_vol_idx] if len(row) > weekly_vol_idx else ''
+                current_week = ''
+                if weekly_vol_value:
+                    csv_values = weekly_vol_value.split(',')
+                    current_week = csv_values[-1].strip() if csv_values else ''
+
+                athlete_data = {
+                    'athlete': row[athlete_idx] if len(row) > athlete_idx else '',
+                    'yearly_distance': float(row[distance_idx]) if len(row) > distance_idx and row[distance_idx] else 0,
+                    'number_of_runs': int(row[runs_idx]) if len(row) > runs_idx and row[runs_idx] else 0,
+                    'current_week': current_week
+                }
+                data.append(athlete_data)
+
+        return data
+    except Exception as e:
+        print(f"Error fetching Google Sheets data: {e}")
+        return []
+
+def get_athlete_credentials(athlete_name=None):
+    """Fetch athlete Strava credentials from Google Sheets"""
+    try:
+        service = get_sheets_service(readonly=True)
+        sheet = service.spreadsheets()
+        result = sheet.values().get(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            range=f'{ATHLETE_CREDS_SHEET_NAME}!A:G'
+        ).execute()
+
+        values = result.get('values', [])
+        if not values:
+            return None if athlete_name else []
+
+        headers = values[0]
+        print(f"DEBUG: Athlete credentials headers: {headers}")
+
+        try:
+            id_idx = headers.index('ID')
+            name_idx = headers.index('Name')
+            refresh_token_idx = headers.index('Refresh_token')
+            access_token_idx = headers.index('Access_token')
+            expires_at_idx = headers.index('Expires_at(EPOC)')
+        except ValueError as e:
+            print(f"ERROR - Column not found in Athelete sheet: {e}")
+            print(f"Available columns: {headers}")
+            return None if athlete_name else []
+
+        athletes_creds = []
+        for row_num, row in enumerate(values[1:], start=2):  # Start at 2 for actual row number
+            if len(row) > max(id_idx, name_idx, refresh_token_idx, access_token_idx, expires_at_idx):
+                strava_id = row[id_idx] if len(row) > id_idx else ''
+                name = row[name_idx] if len(row) > name_idx else ''
+
+                # Skip if not a valid Strava ID
+                if not strava_id or strava_id == 'StravaSetupNeeded':
+                    continue
+
+                athlete_cred = {
+                    'name': name,
+                    'strava_id': strava_id,
+                    'refresh_token': row[refresh_token_idx] if len(row) > refresh_token_idx else '',
+                    'access_token': row[access_token_idx] if len(row) > access_token_idx else '',
+                    'expires_at': int(row[expires_at_idx]) if len(row) > expires_at_idx and row[expires_at_idx] else 0,
+                    'row_number': row_num
+                }
+
+                if athlete_name:
+                    if name == athlete_name:
+                        return athlete_cred
+                else:
+                    athletes_creds.append(athlete_cred)
+
+        return None if athlete_name else athletes_creds
+    except Exception as e:
+        print(f"Error fetching athlete credentials: {e}")
+        return None if athlete_name else []
+
+def update_athlete_tokens(row_number, access_token, refresh_token, expires_at):
+    """Update athlete tokens in Google Sheets"""
+    try:
+        service = get_sheets_service(readonly=False)
+
+        # Calculate expires_in (usually 6 hours = 21600 seconds)
+        expires_in = expires_at - int(time.time())
+
+        # Format expires_at as readable date
+        from datetime import datetime as dt
+        expires_at_readable = dt.fromtimestamp(expires_at).strftime('%Y-%m-%d %H:%M:%S')
+
+        # Update columns D (Access_token), C (Refresh_token), E (Expires_at(EPOC)), F (Expires_in), G (Expires at)
+        values = [
+            [refresh_token, access_token, str(expires_at), str(expires_in), expires_at_readable]
+        ]
+
+        body = {
+            'values': values
+        }
+
+        # Update range C:G for the specific row
+        range_name = f'{ATHLETE_CREDS_SHEET_NAME}!C{row_number}:G{row_number}'
+
+        result = service.spreadsheets().values().update(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            range=range_name,
+            valueInputOption='RAW',
+            body=body
+        ).execute()
+
+        print(f"Updated {result.get('updatedCells')} cells for row {row_number}")
+        return True
+    except Exception as e:
+        print(f"Error updating athlete tokens: {e}")
+        return False
+
+def get_athlete_token(athlete_name):
+    """Get valid token for a specific athlete, refreshing if necessary"""
+    creds = get_athlete_credentials(athlete_name)
+    if not creds:
+        return None
+
+    # Check if token is expired (with 5 minute buffer)
+    if creds['expires_at'] <= int(time.time()) + 300:
+        # Token is expired or about to expire, refresh it
+        try:
+            token_resp = requests.post('https://www.strava.com/oauth/token', data={
+                'client_id': STRAVA_CLIENT_ID,
+                'client_secret': STRAVA_CLIENT_SECRET,
+                'grant_type': 'refresh_token',
+                'refresh_token': creds['refresh_token']
+            })
+            if token_resp.ok:
+                token_data = token_resp.json()
+                new_access_token = token_data.get('access_token')
+                new_refresh_token = token_data.get('refresh_token')
+                new_expires_at = token_data.get('expires_at')
+
+                if new_access_token and new_refresh_token and new_expires_at:
+                    # Update the sheet with new tokens
+                    update_athlete_tokens(creds['row_number'], new_access_token, new_refresh_token, new_expires_at)
+                    return new_access_token
+        except Exception as e:
+            print(f"Error refreshing athlete token: {e}")
+            return None
+
+    return creds['access_token']
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
@@ -197,7 +397,10 @@ def fetch_activities():
 
 @app.route('/activity/<int:activity_id>', methods=['GET', 'POST'])
 def activity_detail(activity_id):
-    token = get_token()
+    # Check if we're viewing a specific athlete's activities
+    token = session.get('athlete_token')
+    if not token:
+        token = get_token()
     analysis_query = session.get('analysis_query', '')
     if not token:
         return redirect(url_for('index'))
@@ -239,7 +442,10 @@ def activity_detail(activity_id):
 @app.route('/api/analyze_activity/<int:activity_id>', methods=['POST'])
 def api_analyze_activity(activity_id):
     """API endpoint for analyzing a single activity with detailed data"""
-    token = get_token()
+    # Check if we're viewing a specific athlete's activities
+    token = session.get('athlete_token')
+    if not token:
+        token = get_token()
     analysis_query = session.get('analysis_query', '')
     if not token:
         return jsonify({'error': 'Not authenticated'}), 401
@@ -463,6 +669,125 @@ def select_activity():
         }
         return render_template('select.html', activities=activities, analysis_query=analysis_query, summary=summary)
     return redirect(url_for('activity_detail', activity_id=activity_id))
+
+@app.route('/athletes')
+def athletes():
+    """Display athlete summary from Google Sheets"""
+    # Get sort parameters from query string
+    sort_by = request.args.get('sort', 'yearly_distance')
+    order = request.args.get('order', 'desc')
+
+    # Fetch data from Google Sheets
+    athletes_data = get_athletes_data()
+
+    # Get athlete credentials to check who has valid Strava access
+    athlete_creds = get_athlete_credentials()
+    valid_strava_names = {cred['name'] for cred in athlete_creds}
+
+    # Add has_strava flag to each athlete
+    for athlete in athletes_data:
+        athlete['has_strava'] = athlete['athlete'] in valid_strava_names
+
+    # Find max yearly distance and max current week
+    max_yearly_distance = max([a['yearly_distance'] for a in athletes_data]) if athletes_data else 0
+    max_current_week = max([float(a['current_week']) if a['current_week'] else 0 for a in athletes_data]) if athletes_data else 0
+
+    # Sort the data
+    reverse = (order == 'desc')
+    if sort_by == 'athlete':
+        athletes_data.sort(key=lambda x: x['athlete'].lower(), reverse=reverse)
+    elif sort_by == 'yearly_distance':
+        athletes_data.sort(key=lambda x: x['yearly_distance'], reverse=reverse)
+    elif sort_by == 'number_of_runs':
+        athletes_data.sort(key=lambda x: x['number_of_runs'], reverse=reverse)
+    elif sort_by == 'current_week':
+        athletes_data.sort(key=lambda x: float(x['current_week']) if x['current_week'] else 0, reverse=reverse)
+
+    return render_template('athletes.html', athletes=athletes_data, sort_by=sort_by, order=order,
+                         max_yearly_distance=max_yearly_distance, max_current_week=max_current_week)
+
+@app.route('/athlete/<athlete_name>')
+def athlete_profile(athlete_name):
+    """Display individual athlete profile with ability to fetch their activities"""
+    # Get athlete summary from Sheet1
+    athletes_data = get_athletes_data()
+    athlete_summary = next((a for a in athletes_data if a['athlete'] == athlete_name), None)
+
+    if not athlete_summary:
+        return redirect(url_for('athletes'))
+
+    # Get athlete credentials
+    athlete_creds = get_athlete_credentials(athlete_name)
+    if not athlete_creds:
+        return redirect(url_for('athletes'))
+
+    # Store selected athlete in session
+    session['selected_athlete'] = athlete_name
+
+    return render_template('athlete_profile.html', athlete=athlete_summary, athlete_name=athlete_name)
+
+@app.route('/athlete/<athlete_name>/activities', methods=['POST'])
+def fetch_athlete_activities(athlete_name):
+    """Fetch activities for a specific athlete"""
+    date = request.form.get('date')
+    end_date = request.form.get('end_date', '').strip()
+    analysis_query = request.form.get('analysis_query', '').strip()
+
+    if not date:
+        return redirect(url_for('athlete_profile', athlete_name=athlete_name))
+
+    # Store in session
+    session['date'] = date
+    session['end_date'] = end_date
+    session['analysis_query'] = analysis_query
+    session['selected_athlete'] = athlete_name
+
+    # Get valid token for this athlete
+    token = get_athlete_token(athlete_name)
+    if not token:
+        return render_template('athlete_profile.html',
+                             athlete=get_athletes_data(),
+                             athlete_name=athlete_name,
+                             error='Failed to get valid Strava token for this athlete')
+
+    session['athlete_token'] = token
+
+    # Fetch activities
+    start_dt = datetime.strptime(date, '%Y-%m-%d')
+    if end_date:
+        end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+    else:
+        end_dt = start_dt
+
+    after = int(start_dt.replace(hour=0, minute=0, second=0).timestamp())
+    before = int(end_dt.replace(hour=23, minute=59, second=59).timestamp())
+
+    headers = {'Authorization': f'Bearer {token}'}
+    params = {'after': after, 'before': before, 'per_page': 100}
+    resp = requests.get(STRAVA_ACTIVITIES_URL, headers=headers, params=params)
+    activities = resp.json() if resp.ok else []
+
+    # Convert distances to miles and add pace (min/mile)
+    for act in activities:
+        if 'distance' in act:
+            act['distance_miles'] = round(act['distance'] / 1609.34, 2)
+        if 'moving_time' in act and act.get('distance_miles', 0) > 0:
+            pace_seconds = act['moving_time'] / act['distance_miles']
+            pace_min = int(pace_seconds // 60)
+            pace_sec = int(pace_seconds % 60)
+            act['pace_min_per_mile'] = f"{pace_min}:{pace_sec:02d}"
+        else:
+            act['pace_min_per_mile'] = 'N/A'
+
+    if not activities:
+        athletes_data = get_athletes_data()
+        athlete_summary = next((a for a in athletes_data if a['athlete'] == athlete_name), None)
+        return render_template('athlete_profile.html',
+                             athlete=athlete_summary,
+                             athlete_name=athlete_name,
+                             error='No activities found for this date range.')
+
+    return render_template('select.html', activities=activities, analysis_query=analysis_query, athlete_name=athlete_name)
 
 if __name__ == '__main__':
     app.run(debug=True, port=4200, host='localhost')

@@ -1,2 +1,7 @@
 /.env
 /token_store.json
+/njmaniacs-485422-8e16104bb447.json
+__pycache__/
+*.pyc
+.vscode/settings.json
+.DS_Store
