@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, session
+from flask import Flask, render_template, request, redirect, url_for, session, jsonify
 from dotenv import load_dotenv
 import os
 import requests
@@ -6,6 +6,8 @@ import openai
 from datetime import datetime
 from urllib.parse import urlencode
 import markdown2
+import json
+import time
 
 load_dotenv()
 
@@ -19,6 +21,80 @@ STRAVA_CLIENT_ID = os.getenv('STRAVA_CLIENT_ID')
 STRAVA_CLIENT_SECRET = os.getenv('STRAVA_CLIENT_SECRET')
 STRAVA_REDIRECT_URI = os.getenv('STRAVA_REDIRECT_URI', 'http://localhost:4200/callback')
 OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4')
+TOKEN_FILE = 'token_store.json'
+
+# Token management functions
+def save_tokens(access_token, refresh_token, expires_at):
+    """Save tokens to persistent storage"""
+    token_data = {
+        'access_token': access_token,
+        'refresh_token': refresh_token,
+        'expires_at': expires_at
+    }
+    with open(TOKEN_FILE, 'w') as f:
+        json.dump(token_data, f)
+
+def load_tokens():
+    """Load tokens from persistent storage"""
+    if not os.path.exists(TOKEN_FILE):
+        return None
+    try:
+        with open(TOKEN_FILE, 'r') as f:
+            return json.load(f)
+    except:
+        return None
+
+def refresh_access_token(refresh_token):
+    """Refresh the access token using the refresh token"""
+    try:
+        token_resp = requests.post('https://www.strava.com/oauth/token', data={
+            'client_id': STRAVA_CLIENT_ID,
+            'client_secret': STRAVA_CLIENT_SECRET,
+            'grant_type': 'refresh_token',
+            'refresh_token': refresh_token
+        })
+        if token_resp.ok:
+            token_data = token_resp.json()
+            access_token = token_data.get('access_token')
+            new_refresh_token = token_data.get('refresh_token')
+            expires_at = token_data.get('expires_at')
+            if access_token and new_refresh_token and expires_at:
+                save_tokens(access_token, new_refresh_token, expires_at)
+                return access_token
+    except:
+        pass
+    return None
+
+def get_valid_token():
+    """Get a valid access token, refreshing if necessary"""
+    tokens = load_tokens()
+    if not tokens:
+        return None
+
+    # Check if token is expired (with 5 minute buffer)
+    if tokens['expires_at'] <= int(time.time()) + 300:
+        # Token is expired or about to expire, refresh it
+        new_token = refresh_access_token(tokens['refresh_token'])
+        if new_token:
+            return new_token
+        return None
+
+    return tokens['access_token']
+
+def get_token():
+    """Get token from session or storage, with auto-refresh"""
+    # First try session
+    token = session.get('token')
+    if token:
+        return token
+
+    # Fall back to stored token with auto-refresh
+    token = get_valid_token()
+    if token:
+        session['token'] = token
+        return token
+
+    return None
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
@@ -29,12 +105,20 @@ def index():
         session['date'] = date
         session['end_date'] = end_date
         session['analysis_query'] = analysis_query
-        # Start OAuth flow
+
+        # Check if we have a valid token already
+        valid_token = get_valid_token()
+        if valid_token:
+            # Skip OAuth flow, go directly to fetching activities
+            session['token'] = valid_token
+            return redirect(url_for('fetch_activities'))
+
+        # Start OAuth flow only if no valid token exists
         params = {
             'client_id': STRAVA_CLIENT_ID,
             'response_type': 'code',
             'redirect_uri': STRAVA_REDIRECT_URI,
-            'approval_prompt': 'force',
+            'approval_prompt': 'auto',  # Changed from 'force' to 'auto' to avoid re-authorization
             'scope': 'activity:read_all'
         }
         auth_url = f"https://www.strava.com/oauth/authorize?{urlencode(params)}"
@@ -58,9 +142,35 @@ def callback():
     })
     token_data = token_resp.json()
     access_token = token_data.get('access_token')
-    if not access_token:
+    refresh_token = token_data.get('refresh_token')
+    expires_at = token_data.get('expires_at')
+
+    if not access_token or not refresh_token:
         return render_template('index.html', error='Failed to get Strava access token.')
+
+    # Save tokens persistently
+    save_tokens(access_token, refresh_token, expires_at)
     session['token'] = access_token
+    return redirect(url_for('fetch_activities'))
+
+@app.route('/fetch_activities')
+def fetch_activities():
+    """Fetch activities for the date range stored in session"""
+    token = session.get('token')
+    date = session.get('date')
+    end_date = session.get('end_date', '')
+    analysis_query = session.get('analysis_query', '')
+
+    if not date:
+        return redirect(url_for('index'))
+
+    # Get valid token (will auto-refresh if needed)
+    if not token:
+        token = get_valid_token()
+        if not token:
+            return redirect(url_for('index'))
+        session['token'] = token
+
     # Fetch activities for the date range
     start_dt = datetime.strptime(date, '%Y-%m-%d')
     if end_date:
@@ -69,7 +179,7 @@ def callback():
         end_dt = start_dt
     after = int(start_dt.replace(hour=0, minute=0, second=0).timestamp())
     before = int(end_dt.replace(hour=23, minute=59, second=59).timestamp())
-    headers = {'Authorization': f'Bearer {access_token}'}
+    headers = {'Authorization': f'Bearer {token}'}
     params = {'after': after, 'before': before, 'per_page': 100}
     resp = requests.get(STRAVA_ACTIVITIES_URL, headers=headers, params=params)
     activities = resp.json() if resp.ok else []
@@ -87,7 +197,7 @@ def callback():
 
 @app.route('/activity/<int:activity_id>', methods=['GET', 'POST'])
 def activity_detail(activity_id):
-    token = session.get('token')
+    token = get_token()
     analysis_query = session.get('analysis_query', '')
     if not token:
         return redirect(url_for('index'))
@@ -102,13 +212,21 @@ def activity_detail(activity_id):
     if request.method == 'POST' and activity:
         try:
             openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
-            prompt = f"Analyze this Strava activity: {activity}"
+            system_prompt = """You are a fitness data analyst. When analyzing activities:
+- Use US units: miles (not kilometers), minutes per mile for pace (not min/km)
+- Convert all distances to miles (1 km = 0.621371 miles)
+- Show pace in minutes per mile format (e.g., 8:30 min/mi)
+- Display splits in miles unless the activity has custom splits
+- Use feet for elevation (not meters)
+- Provide clear, actionable insights"""
+
+            prompt = f"Analyze this Strava activity in detail: {activity}"
             if analysis_query:
                 prompt += f"\nFocus on: {analysis_query}"
             response = openai_client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[
-                    {"role": "system", "content": "You are a fitness data analyst."},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt}
                 ]
             )
@@ -118,9 +236,59 @@ def activity_detail(activity_id):
             error = f'OpenAI API error: {e}'
     return render_template('activity.html', activity=activity, analysis=analysis, analysis_html=analysis_html, error=error)
 
+@app.route('/api/analyze_activity/<int:activity_id>', methods=['POST'])
+def api_analyze_activity(activity_id):
+    """API endpoint for analyzing a single activity with detailed data"""
+    token = get_token()
+    analysis_query = session.get('analysis_query', '')
+    if not token:
+        return jsonify({'error': 'Not authenticated'}), 401
+
+    # Fetch detailed activity data from Strava
+    headers = {'Authorization': f'Bearer {token}'}
+    resp = requests.get(STRAVA_ACTIVITY_DETAIL_URL.format(activity_id), headers=headers)
+
+    if not resp.ok:
+        return jsonify({'error': 'Failed to fetch activity details from Strava'}), 500
+
+    activity = resp.json()
+
+    # Analyze with OpenAI
+    try:
+        openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        system_prompt = """You are a fitness data analyst. When analyzing activities:
+- Use US units: miles (not kilometers), minutes per mile for pace (not min/km)
+- Convert all distances to miles (1 km = 0.621371 miles)
+- Show pace in minutes per mile format (e.g., 8:30 min/mi)
+- Display splits in miles unless the activity has custom splits
+- Use feet for elevation (not meters)
+- Provide clear, actionable insights"""
+
+        prompt = f"Analyze this Strava activity in detail: {activity}"
+        if analysis_query:
+            prompt += f"\nFocus on: {analysis_query}"
+
+        response = openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        analysis = response.choices[0].message.content.strip()
+        analysis_html = markdown2.markdown(analysis)
+
+        return jsonify({
+            'success': True,
+            'analysis': analysis,
+            'analysis_html': analysis_html
+        })
+    except Exception as e:
+        return jsonify({'error': f'OpenAI API error: {str(e)}'}), 500
+
 @app.route('/analyze_list', methods=['GET', 'POST'])
 def analyze_list():
-    token = session.get('token')
+    token = get_token()
     date = session.get('date')
     end_date = session.get('end_date', '')
     if request.method == 'POST':
@@ -174,6 +342,14 @@ def analyze_list():
         }
     elif request.method == 'POST' or 'analyze_list' in request.args:
         openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        system_prompt = """You are a fitness data analyst. When analyzing activities:
+- Use US units: miles (not kilometers), minutes per mile for pace (not min/km)
+- Convert all distances to miles (1 km = 0.621371 miles)
+- Show pace in minutes per mile format (e.g., 8:30 min/mi)
+- Display splits in miles unless the activity has custom splits
+- Use feet for elevation (not meters)
+- Provide clear, actionable insights and trends across all activities"""
+
         prompt = f"Analyze this list of Strava activities: {activities}"
         if analysis_query:
             prompt += f"\nFocus on: {analysis_query}"
@@ -181,7 +357,7 @@ def analyze_list():
             response = openai_client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[
-                    {"role": "system", "content": "You are a fitness data analyst."},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt}
                 ]
             )
@@ -195,7 +371,7 @@ def analyze_list():
 def select_activity():
     if request.method == 'GET':
         # Show activities after pulling, for GET requests
-        token = session.get('token')
+        token = get_token()
         date = session.get('date')
         end_date = session.get('end_date', '')
         analysis_query = session.get('analysis_query', '')
@@ -227,7 +403,7 @@ def select_activity():
         return analyze_list()
     if 'summarize' in request.form:
         # Always fetch activities before summarizing
-        token = session.get('token')
+        token = get_token()
         date = session.get('date')
         end_date = session.get('end_date', '')
         if not token or not date:

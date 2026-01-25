@@ -4,9 +4,21 @@
 <form method="post" action="{{ url_for('select_activity') }}" id="select-activity-form">
     <ul class="list-group mb-3">
         {% for act in activities %}
-        <li class="list-group-item d-flex justify-content-between align-items-center">
-            <span>{{ act.name }} ({{ act.type }}, {{ act.distance_miles }} mi, {{ act.pace_min_per_mile }} min/mi)</span>
-            <button name="activity_id" value="{{ act.id }}" class="btn btn-outline-primary btn-sm">Analyze</button>
+        <li class="list-group-item" id="activity-{{ act.id }}">
+            <div class="d-flex justify-content-between align-items-center">
+                <span>{{ act.name }} ({{ act.type }}, {{ act.distance_miles }} mi, {{ act.pace_min_per_mile }} min/mi)</span>
+                <button type="button" class="btn btn-outline-primary btn-sm analyze-btn" data-activity-id="{{ act.id }}" onclick="analyzeActivity({{ act.id }}, this)">Analyze</button>
+            </div>
+            <div id="loading-{{ act.id }}" class="mt-2 text-center" style="display:none;">
+                <div class="spinner-border spinner-border-sm text-primary" role="status">
+                    <span class="visually-hidden">Loading...</span>
+                </div>
+                <small class="ms-2">Fetching detailed data and analyzing with OpenAI...</small>
+            </div>
+            <div id="analysis-{{ act.id }}" class="mt-3 p-3 bg-light border rounded" style="display:none;">
+                <h6>Analysis Results:</h6>
+                <div id="analysis-content-{{ act.id }}"></div>
+            </div>
         </li>
         {% endfor %}
     </ul>
@@ -76,6 +88,54 @@ function downloadSummaryCSV() {
     <div>Fetching response from OpenAI...</div>
 </div>
 <script>
+  function analyzeActivity(activityId, button) {
+    // Show loading spinner
+    document.getElementById('loading-' + activityId).style.display = 'block';
+    // Hide analysis if previously shown
+    document.getElementById('analysis-' + activityId).style.display = 'none';
+    // Disable the analyze button
+    button.disabled = true;
+    button.innerText = 'Analyzing...';
+
+    // Make AJAX request to analyze endpoint
+    fetch('/api/analyze_activity/' + activityId, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    })
+    .then(response => response.json())
+    .then(data => {
+      // Hide loading spinner
+      document.getElementById('loading-' + activityId).style.display = 'none';
+      // Re-enable button
+      button.disabled = false;
+      button.innerText = 'Analyze';
+
+      if (data.error) {
+        // Show error
+        document.getElementById('analysis-content-' + activityId).innerHTML =
+          '<div class="alert alert-danger">' + data.error + '</div>';
+        document.getElementById('analysis-' + activityId).style.display = 'block';
+      } else if (data.success) {
+        // Show analysis results
+        document.getElementById('analysis-content-' + activityId).innerHTML = data.analysis_html;
+        document.getElementById('analysis-' + activityId).style.display = 'block';
+      }
+    })
+    .catch(error => {
+      // Hide loading spinner
+      document.getElementById('loading-' + activityId).style.display = 'none';
+      // Re-enable button
+      button.disabled = false;
+      button.innerText = 'Analyze';
+      // Show error
+      document.getElementById('analysis-content-' + activityId).innerHTML =
+        '<div class="alert alert-danger">Error: ' + error.message + '</div>';
+      document.getElementById('analysis-' + activityId).style.display = 'block';
+    });
+  }
+
   window.addEventListener('DOMContentLoaded', function() {
     var form = document.getElementById('select-activity-form');
     var spinner = document.getElementById('loading-spinner');
