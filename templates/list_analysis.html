@@ -1,0 +1,81 @@
+{% extends 'base.html' %}
+{% block content %}
+<h2>Analyze All Activities</h2>
+<form method="post" id="analyze-list-form">
+    <div class="mb-3">
+        <label for="analysis_query" class="form-label">What do you want to analyze? (optional)</label>
+        <input type="text" class="form-control" id="analysis_query" name="analysis_query" value="{{ analysis_query or '' }}" placeholder="e.g. performance, heart rate, calories">
+    </div>
+    <button type="submit" class="btn btn-success" name="analyze_list" value="1">Analyze All Activities with OpenAI</button>
+    <button type="submit" class="btn btn-info ms-2" name="summarize" value="1">Summarize Activities</button>
+</form>
+<div id="loading-spinner" style="display:none;" class="mt-3 text-center">
+    <div class="spinner-border text-primary" role="status">
+      <span class="visually-hidden">Loading...</span>
+    </div>
+    <div>Fetching response from OpenAI...</div>
+</div>
+<script>
+  window.addEventListener('DOMContentLoaded', function() {
+    var form = document.getElementById('analyze-list-form');
+    var spinner = document.getElementById('loading-spinner');
+    if (form) {
+      form.onsubmit = function(e) {
+        var submitter = e.submitter || document.activeElement;
+        if (submitter && submitter.name === 'analyze_list') {
+          form.style.display = 'none';
+          spinner.style.display = 'block';
+          setTimeout(function() { form.submit(); }, 1000);
+          return false;
+        }
+      };
+    }
+    spinner.style.display = 'none';
+  });
+</script>
+{% if summary %}
+<h4 class="mt-4">Weekly Activity Summary</h4>
+<table class="table table-bordered">
+    <thead>
+        <tr>
+            <th>Activity Type</th>
+            <th>Time Spent (hh:mm:ss)</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for row in summary.activity_rows %}
+        <tr>
+            <td>{{ row.type }}</td>
+            <td>{{ row.time }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+    <tfoot>
+        <tr>
+            <th>Total Activity Time</th>
+            <th>{{ summary.total_time }}</th>
+        </tr>
+    </tfoot>
+</table>
+{% endif %}
+<h4 class="mt-4">Activities</h4>
+<ul class="list-group mb-3">
+    {% for act in activities %}
+    <li class="list-group-item">
+        {{ act.name }} ({{ act.type }}, {{ act.distance_miles }} mi, {{ act.pace_min_per_mile }} min/mi)
+    </li>
+    {% endfor %}
+</ul>
+{% if analysis_html %}
+<div class="mt-4">
+    <h4>AI Analysis</h4>
+    <div class="alert alert-info" style="white-space:normal;">{{ analysis_html|safe }}</div>
+</div>
+{% elif analysis %}
+<div class="mt-4">
+    <h4>AI Analysis</h4>
+    <div class="alert alert-info" style="white-space:pre-line;">{{ analysis|e|replace('\n', '<br>')|safe }}</div>
+</div>
+{% endif %}
+<a href="{{ url_for('index') }}" class="btn btn-link mt-3">&larr; Back to main page</a>
+{% endblock %}

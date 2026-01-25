@@ -1,0 +1,95 @@
+{% extends 'base.html' %}
+{% block content %}
+<h2>Select an Activity to Analyze</h2>
+<form method="post" action="{{ url_for('select_activity') }}" id="select-activity-form">
+    <ul class="list-group mb-3">
+        {% for act in activities %}
+        <li class="list-group-item d-flex justify-content-between align-items-center">
+            <span>{{ act.name }} ({{ act.type }}, {{ act.distance_miles }} mi, {{ act.pace_min_per_mile }} min/mi)</span>
+            <button name="activity_id" value="{{ act.id }}" class="btn btn-outline-primary btn-sm">Analyze</button>
+        </li>
+        {% endfor %}
+    </ul>
+    <div class="mb-3">
+        <label for="analysis_query" class="form-label">What do you want to analyze? (optional)</label>
+        <input type="text" class="form-control" id="analysis_query" name="analysis_query" value="{{ analysis_query or '' }}" placeholder="e.g. performance, heart rate, calories">
+    </div>
+    <button type="submit" class="btn btn-success" name="analyze_list" value="1">Analyze All Activities with OpenAI</button>
+    <button type="submit" class="btn btn-info ms-2" name="summarize" value="1">Summarize Activities</button>
+</form>
+{% if summary %}
+<h4 class="mt-4">Weekly Activity Summary</h4>
+<table class="table table-bordered" id="summary-table">
+    <thead>
+        <tr>
+            <th>Week Starting</th>
+            {% for t in summary.activity_types %}
+            <th>{{ t }}</th>
+            {% endfor %}
+            <th>Total</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for row in summary.rows %}
+        <tr>
+            <td>{{ row.week }}</td>
+            {% for t in summary.activity_types %}
+            <td>{{ row[t] }}</td>
+            {% endfor %}
+            <td>{{ row.total }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+<div class="mt-3">
+    <a href="{{ url_for('index') }}" class="btn btn-secondary">Back to Home</a>
+    <button class="btn btn-primary ms-2" onclick="downloadSummaryCSV(); return false;">Download CSV</button>
+</div>
+<script>
+function downloadSummaryCSV() {
+    var table = document.getElementById('summary-table');
+    var rows = table.querySelectorAll('tr');
+    var csv = [];
+    for (var i = 0; i < rows.length; i++) {
+        var cols = rows[i].querySelectorAll('th,td');
+        var row = [];
+        for (var j = 0; j < cols.length; j++) {
+            row.push('"' + cols[j].innerText.replace(/"/g, '""') + '"');
+        }
+        csv.push(row.join(','));
+    }
+    var csvContent = csv.join('\n');
+    var blob = new Blob([csvContent], { type: 'text/csv' });
+    var link = document.createElement('a');
+    link.href = window.URL.createObjectURL(blob);
+    link.download = 'strava_summary.csv';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+}
+</script>
+{% endif %}
+<div id="loading-spinner" style="display:none;" class="mt-3 text-center">
+    <div class="spinner-border text-primary" role="status">
+      <span class="visually-hidden">Loading...</span>
+    </div>
+    <div>Fetching response from OpenAI...</div>
+</div>
+<script>
+  window.addEventListener('DOMContentLoaded', function() {
+    var form = document.getElementById('select-activity-form');
+    var spinner = document.getElementById('loading-spinner');
+    if (form) {
+      form.addEventListener('submit', function(e) {
+        // Only show spinner if the all-activity button is clicked
+        var submitter = e.submitter || document.activeElement;
+        if (submitter && submitter.name === 'analyze_list') {
+          form.style.display = 'none';
+          spinner.style.display = 'block';
+        }
+      });
+    }
+    spinner.style.display = 'none';
+  });
+</script>
+{% endblock %}
