@@ -5,7 +5,7 @@ A Flask web application that fetches Strava activities and analyzes them using O
 ## Features
 
 - 🏃 Fetch Strava activities for any date range
-- 🤖 AI-powered activity analysis using OpenAI (GPT-4)
+- 🤖 AI-powered activity analysis using OpenAI (GPT-5.1)
 - 👥 Multi-athlete support with Google Sheets integration
 - 📊 Athlete summary dashboard with yearly stats
 - 🔄 Automatic token refresh for persistent authentication
@@ -27,7 +27,7 @@ A Flask web application that fetches Strava activities and analyzes them using O
      STRAVA_CLIENT_SECRET=your_client_secret
      STRAVA_REDIRECT_URI=http://localhost:4200/callback
      OPENAI_API_KEY=your_openai_key
-     OPENAI_MODEL=gpt-4
+     OPENAI_MODEL=gpt-5.1
      ```
 
 3. **Add Google Sheets credentials:**
@@ -78,7 +78,7 @@ A Flask web application that fetches Strava activities and analyzes them using O
    - **Name**: `strava-ai-analyzer` (or your choice)
    - **Environment**: `Python 3`
    - **Build Command**: `pip install -r requirements.txt`
-   - **Start Command**: `gunicorn app:app`
+   - **Start Command**: `gunicorn app:app --timeout 120 --workers 1`
    - **Plan**: Select "Free"
 
 5. Click "Create Web Service"
@@ -92,7 +92,7 @@ STRAVA_CLIENT_ID=your_strava_client_id
 STRAVA_CLIENT_SECRET=your_strava_client_secret
 STRAVA_REDIRECT_URI=https://your-app-name.onrender.com/callback
 OPENAI_API_KEY=your_openai_api_key
-OPENAI_MODEL=gpt-4
+OPENAI_MODEL=gpt-4o
 ```
 
 **Important**: Replace `your-app-name` with your actual Render app name!
