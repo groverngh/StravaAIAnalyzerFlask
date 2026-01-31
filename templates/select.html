@@ -20,7 +20,7 @@
                 <div class="spinner-border spinner-border-sm text-primary" role="status">
                     <span class="visually-hidden">Loading...</span>
                 </div>
-                <small class="ms-2">Fetching detailed data and analyzing with OpenAI...</small>
+                <small class="ms-2">Fetching detailed data and analyzing with AI...</small>
             </div>
             <div id="analysis-{{ act.id }}" class="mt-3 p-3 bg-light border rounded" style="display:none;">
                 <h6>Analysis Results:</h6>
@@ -110,6 +110,30 @@ function downloadSummaryCSV() {
           </select>
         </div>
 
+        <!-- Model Selection -->
+        <div class="mb-4">
+          <label for="llm-model" class="form-label fw-bold">AI Model:</label>
+          <select class="form-select" id="llm-model">
+            <!-- Groq Models -->
+            {% if groq_models %}
+            <optgroup label="Groq Models">
+            {% for model in groq_models %}
+              <option value="{{ model }}" {% if model == default_model %}selected{% endif %}>{{ model }}</option>
+            {% endfor %}
+            </optgroup>
+            {% endif %}
+
+            <!-- OpenAI Models -->
+            {% if openai_models %}
+            <optgroup label="OpenAI Models">
+            {% for model in openai_models %}
+              <option value="{{ model }}" {% if model == default_model %}selected{% endif %}>{{ model }}</option>
+            {% endfor %}
+            </optgroup>
+            {% endif %}
+          </select>
+        </div>
+
         <!-- Analysis Mode Selection -->
         <div class="d-grid gap-3">
           <button type="button" class="btn btn-outline-secondary btn-lg text-start" onclick="runAnalysis('nerd')">
@@ -146,8 +170,9 @@ function downloadSummaryCSV() {
   }
 
   function runAnalysis(mode) {
-    // Get selected training intent
+    // Get selected training intent and model
     var trainingIntent = document.getElementById('training-intent').value;
+    var llmModel = document.getElementById('llm-model').value;
 
     // Hide the modal
     var modal = bootstrap.Modal.getInstance(document.getElementById('modeModal'));
@@ -166,7 +191,8 @@ function downloadSummaryCSV() {
       },
       body: JSON.stringify({
         mode: mode,
-        training_intent: trainingIntent
+        training_intent: trainingIntent,
+        model: llmModel
       })
     })
     .then(response => response.json())

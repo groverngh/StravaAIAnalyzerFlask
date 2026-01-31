@@ -2,7 +2,8 @@ from flask import Flask, render_template, request, redirect, url_for, session, j
 from dotenv import load_dotenv
 import os
 import requests
-import openai
+import openai  # Re-enabled for hybrid OpenAI + Groq support
+from groq import Groq
 from datetime import datetime
 from urllib.parse import urlencode
 import markdown2
@@ -22,12 +23,33 @@ app.secret_key = os.urandom(24)
 
 STRAVA_ACTIVITIES_URL = 'https://www.strava.com/api/v3/athlete/activities'
 STRAVA_ACTIVITY_DETAIL_URL = 'https://www.strava.com/api/v3/activities/{}'
+
+# OpenAI Configuration
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+OPENAI_DEFAULT_MODEL = os.getenv('OPENAI_DEFAULT_MODEL', 'gpt-4o')
+OPENAI_MODELS = os.getenv('OPENAI_MODELS', 'gpt-4o,gpt-4o-mini,o1-mini,o1').split(',') if os.getenv('OPENAI_MODELS') else []
+
+# Groq Configuration
+GROQ_API_KEY = os.getenv('GROQ_API_KEY')
+GROQ_DEFAULT_MODEL = os.getenv('GROQ_DEFAULT_MODEL', 'llama-3.3-70b-versatile')
+GROQ_MODELS = os.getenv('GROQ_MODELS', 'llama-3.3-70b-versatile,llama-3.1-70b-versatile,mixtral-8x7b-32768,gemma2-9b-it').split(',')
+
+# Combine all models for dropdown (Groq first, then OpenAI if available)
+ALL_MODELS = GROQ_MODELS.copy()
+if OPENAI_MODELS and OPENAI_API_KEY:
+    ALL_MODELS.extend(OPENAI_MODELS)
+
+# Determine overall default model (prefer Groq)
+DEFAULT_MODEL = GROQ_DEFAULT_MODEL if GROQ_API_KEY else (OPENAI_DEFAULT_MODEL if OPENAI_API_KEY else 'llama-3.3-70b-versatile')
+
 STRAVA_CLIENT_ID = os.getenv('STRAVA_CLIENT_ID')
 STRAVA_CLIENT_SECRET = os.getenv('STRAVA_CLIENT_SECRET')
 STRAVA_REDIRECT_URI = os.getenv('STRAVA_REDIRECT_URI', 'http://localhost:4200/callback')
-OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-5.1')
-NUM_ANALYSIS_PER_DAY = int(os.getenv('NUM_ANALYSIS', '0'))  # 0 = unlimited
+
+# Rate limiting configuration (separate limits for OpenAI vs Groq)
+NUM_ANALYSIS_OPENAI = int(os.getenv('NUM_ANALYSIS_OPENAI', '0'))  # 0 = unlimited
+NUM_ANALYSIS_GROQ = int(os.getenv('NUM_ANALYSIS_GROQ', '0'))  # 0 = unlimited
+DEBUG_SKIP_LLM = os.getenv('DEBUG_SKIP_LLM', 'false').lower() == 'true'
 TOKEN_FILE = 'token_store.json'
 GOOGLE_SHEETS_CREDENTIALS_FILE = 'njmaniacs-485422-8e16104bb447.json'
 GOOGLE_SHEET_ID = '1POa75jrHHYwyfBAC0aObgc01HEFPnjl7ongLAJhqfa0'
@@ -270,6 +292,20 @@ def update_athlete_tokens(row_number, access_token, refresh_token, expires_at):
         print(f"Error updating athlete tokens: {e}")
         return False
 
+def get_model_provider(model_name):
+    """Determine which provider a model belongs to
+
+    Args:
+        model_name (str): Model identifier
+
+    Returns:
+        str: 'openai' or 'groq'
+    """
+    if model_name in OPENAI_MODELS:
+        return 'openai'
+    else:
+        return 'groq'
+
 def get_client_ip():
     """Get client IP address, handling proxies"""
     if request.headers.get('X-Forwarded-For'):
@@ -281,76 +317,86 @@ def get_client_ip():
         ip = request.remote_addr
     return ip
 
-def check_analysis_limit(ip_address):
-    """Check if IP address has exceeded daily analysis limit
+def check_analysis_limit(ip_address, provider='groq'):
+    """Check if IP address has exceeded daily analysis limit for a specific provider
 
     Args:
         ip_address (str): Client IP address
+        provider (str): 'openai' or 'groq'
 
     Returns:
         tuple: (allowed (bool), count (int), limit (int))
     """
+    # Get the appropriate limit based on provider
+    if provider == 'openai':
+        limit = NUM_ANALYSIS_OPENAI
+    else:
+        limit = NUM_ANALYSIS_GROQ
+
     # If limit is -1, block all analyses
-    if NUM_ANALYSIS_PER_DAY == -1:
+    if limit == -1:
         return False, 0, -1
 
     # If limit is 0, unlimited analyses allowed
-    if NUM_ANALYSIS_PER_DAY == 0:
+    if limit == 0:
         return True, 0, 0
 
     try:
         service = get_sheets_service(readonly=True)
 
-        # Fetch data from AI Analysis sheet
+        # Fetch data from AI Analysis sheet (now includes provider in column F)
         sheet = service.spreadsheets()
         result = sheet.values().get(
             spreadsheetId=GOOGLE_SHEET_ID,
-            range=f'{AI_ANALYSIS_SHEET_NAME}!A:D'
+            range=f'{AI_ANALYSIS_SHEET_NAME}!A:F'
         ).execute()
 
         values = result.get('values', [])
         if not values:
             # No data yet, allow analysis
-            return True, 0, NUM_ANALYSIS_PER_DAY
+            return True, 0, limit
 
         # Get today's date
         today = datetime.now().strftime('%Y-%m-%d')
 
-        # Count analyses for this IP today
+        # Count analyses for this IP today for this provider
         count = 0
         for row in values[1:]:  # Skip header row (row 0)
             if len(row) >= 3:
                 row_ip = row[0] if len(row) > 0 else ''
                 row_date = row[2] if len(row) > 2 else ''
+                row_provider = row[5] if len(row) > 5 else 'groq'  # Default to groq for legacy rows
 
-                if row_ip == ip_address and row_date == today:
+                if row_ip == ip_address and row_date == today and row_provider == provider:
                     count += 1
 
         # Debug logging
-        print(f"[Rate Limit Check] IP: {ip_address}, Date: {today}, Count: {count}, Limit: {NUM_ANALYSIS_PER_DAY}")
+        print(f"[Rate Limit Check] IP: {ip_address}, Provider: {provider}, Date: {today}, Count: {count}, Limit: {limit}")
         print(f"[Rate Limit Check] Total rows in sheet: {len(values)}, Data rows: {len(values)-1}")
 
         # Check if limit would be exceeded
         # count represents analyses ALREADY completed
         # If count >= limit, we've used our quota, so block
-        allowed = count < NUM_ANALYSIS_PER_DAY
+        allowed = count < limit
 
-        print(f"[Rate Limit Check] Allowed: {allowed} (count {count} < limit {NUM_ANALYSIS_PER_DAY})")
+        print(f"[Rate Limit Check] Allowed: {allowed} (count {count} < limit {limit})")
 
-        return allowed, count, NUM_ANALYSIS_PER_DAY
+        return allowed, count, limit
 
     except Exception as e:
         print(f"Error checking analysis limit: {e}")
         # On error, block the analysis (fail closed) to prevent abuse
-        return False, 0, NUM_ANALYSIS_PER_DAY
+        return False, 0, limit
 
-def log_analysis_request(ip_address, athlete_name=None, activity_id=None):
+def log_analysis_request(ip_address, athlete_name=None, activity_id=None, provider='groq', model=None):
     """Log analysis request to Google Sheets
 
     Args:
         ip_address (str): Client IP address
         athlete_name (str, optional): Athlete name if logged in
         activity_id (str, optional): Activity ID analyzed
+        provider (str): 'openai' or 'groq'
+        model (str, optional): Specific model used
     """
     try:
         service = get_sheets_service(readonly=False)
@@ -359,13 +405,15 @@ def log_analysis_request(ip_address, athlete_name=None, activity_id=None):
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         date = datetime.now().strftime('%Y-%m-%d')
 
-        # Prepare row data
+        # Prepare row data (columns A-F)
         values = [[
             ip_address,
             timestamp,
             date,
             athlete_name or 'Unknown',
-            str(activity_id) if activity_id else ''
+            str(activity_id) if activity_id else '',
+            provider,
+            model or ''
         ]]
 
         body = {
@@ -375,13 +423,13 @@ def log_analysis_request(ip_address, athlete_name=None, activity_id=None):
         # Append to AI Analysis sheet
         result = service.spreadsheets().values().append(
             spreadsheetId=GOOGLE_SHEET_ID,
-            range=f'{AI_ANALYSIS_SHEET_NAME}!A:E',
+            range=f'{AI_ANALYSIS_SHEET_NAME}!A:G',
             valueInputOption='RAW',
             insertDataOption='INSERT_ROWS',
             body=body
         ).execute()
 
-        print(f"[Rate Limit Log] Successfully logged: IP={ip_address}, Date={date}, Athlete={athlete_name}, Activity={activity_id}")
+        print(f"[Rate Limit Log] Successfully logged: IP={ip_address}, Provider={provider}, Model={model}, Date={date}, Athlete={athlete_name}, Activity={activity_id}")
         return True
     except Exception as e:
         print(f"Error logging analysis request: {e}")
@@ -522,7 +570,12 @@ def fetch_activities():
         return render_template('my_activities.html', error='No activities found for this date range.')
     if len(activities) == 1:
         return redirect(url_for('activity_detail', activity_id=activities[0]['id']))
-    return render_template('select.html', activities=activities, analysis_query=analysis_query)
+    return render_template('select.html',
+                         activities=activities,
+                         analysis_query=analysis_query,
+                         groq_models=GROQ_MODELS,
+                         openai_models=OPENAI_MODELS,
+                         default_model=DEFAULT_MODEL)
 
 @app.route('/activity/<int:activity_id>', methods=['GET', 'POST'])
 def activity_detail(activity_id):
@@ -543,29 +596,105 @@ def activity_detail(activity_id):
         error = 'Failed to fetch activity details from Strava.'
     if request.method == 'POST' and activity:
         try:
-            openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
-            system_prompt = """You are a fitness data analyst. When analyzing activities:
-- Use US units: miles (not kilometers), minutes per mile for pace (not min/km)
-- Convert all distances to miles (1 km = 0.621371 miles)
-- Show pace in minutes per mile format (e.g., 8:30 min/mi)
-- Display splits in miles unless the activity has custom splits
-- Use feet for elevation (not meters)
-- Provide clear, actionable insights"""
+            # Use default model (prefer Groq if available)
+            provider = get_model_provider(DEFAULT_MODEL)
+
+            # Initialize appropriate client
+            if provider == 'openai':
+                llm_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+            else:
+                llm_client = Groq(api_key=GROQ_API_KEY)
+
+            system_prompt = """You are a fitness data analyst.
+
+CRITICAL - STRAVA API DATA FORMAT:
+- ALL distances in the JSON are in METERS (not miles or kilometers)
+- ALL elevations in the JSON are in METERS (not feet)
+- ALL speeds are in METERS PER SECOND (not mph or min/mile)
+- Times are in SECONDS
+
+REQUIRED CONVERSIONS FOR YOUR ANALYSIS:
+- Distance: divide meters by 1609.34 to get miles
+- Elevation: divide meters by 0.3048 to get feet
+- Pace: (moving_time_seconds / distance_meters) * 26.8224 = minutes per mile
+- Speed: multiply meters/second by 2.23694 to get mph
+
+OUTPUT FORMAT - USE US UNITS:
+- Display all distances in MILES (e.g., "5.2 miles")
+- Display all elevations in FEET (e.g., "450 feet")
+- Display pace in MINUTES PER MILE (e.g., "8:30 min/mi")
+- Display splits in miles unless the activity has custom kilometer splits
+
+Provide clear, actionable insights based on properly converted data."""
 
             prompt = f"Analyze this Strava activity in detail: {activity}"
             if analysis_query:
                 prompt += f"\nFocus on: {analysis_query}"
-            response = openai_client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            analysis = response.choices[0].message.content.strip()
-            analysis_html = markdown2.markdown(analysis)
+
+            # Check if debug mode is enabled
+            if DEBUG_SKIP_LLM:
+                # Save prompt to file instead of calling OpenAI
+                import os as debug_os
+
+                # Create debug_prompts directory if it doesn't exist
+                debug_dir = 'debug_prompts'
+                debug_os.makedirs(debug_dir, exist_ok=True)
+
+                # Generate filename with timestamp
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                filename = f'prompt_{timestamp}_activity_{activity_id}_detail.txt'
+                filepath = debug_os.path.join(debug_dir, filename)
+
+                # Write prompt to file
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    f.write("=" * 80 + "\n")
+                    f.write("DEBUG MODE: LLM Call Skipped - Prompt Saved to File\n")
+                    f.write("=" * 80 + "\n\n")
+                    f.write(f"Activity ID: {activity_id}\n")
+                    f.write(f"Analysis Query: {analysis_query or 'Not specified'}\n")
+                    f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write("\n" + "=" * 80 + "\n")
+                    f.write("SYSTEM PROMPT\n")
+                    f.write("=" * 80 + "\n\n")
+                    f.write(system_prompt)
+                    f.write("\n\n" + "=" * 80 + "\n")
+                    f.write("USER PROMPT\n")
+                    f.write("=" * 80 + "\n\n")
+                    f.write(prompt)
+                    f.write("\n\n" + "=" * 80 + "\n")
+                    f.write("END OF PROMPT\n")
+                    f.write("=" * 80 + "\n")
+
+                print(f"DEBUG MODE: Prompt saved to {filepath}")
+
+                # Return response with file path
+                analysis = f"""# Debug Mode - LLM Call Skipped
+
+**Analysis Query:** {analysis_query or 'Not specified'}
+
+The actual LLM call was skipped because `DEBUG_SKIP_LLM` is enabled.
+
+**Prompt saved to:** `{filepath}`
+
+You can open this file to see the exact system prompt and user prompt that would have been sent to the LLM.
+
+To make actual API calls, set `DEBUG_SKIP_LLM=false` in your .env file.
+"""
+                analysis_html = markdown2.markdown(analysis)
+            else:
+                # Call LLM API (OpenAI or Groq)
+                response = llm_client.chat.completions.create(
+                    model=DEFAULT_MODEL,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+
+                analysis = response.choices[0].message.content.strip()
+                analysis_html = markdown2.markdown(analysis)
         except Exception as e:
-            error = f'OpenAI API error: {e}'
+            error = f'LLM API error: {e}'
     return render_template('activity.html', activity=activity, analysis=analysis, analysis_html=analysis_html, error=error)
 
 @app.route('/api/analyze_activity/<int:activity_id>', methods=['POST'])
@@ -574,32 +703,42 @@ def api_analyze_activity(activity_id):
     # Get client IP address
     client_ip = get_client_ip()
 
-    # Get analysis mode and training intent from request body (nerd, maniac, or nice)
+    # Get analysis mode, training intent, and model from request body
     request_data = request.get_json() or {}
     analysis_mode = request_data.get('mode', 'nerd')
     training_intent = request_data.get('training_intent', '')
+    selected_model = request_data.get('model', DEFAULT_MODEL)
+
+    # Determine provider from selected model
+    provider = get_model_provider(selected_model)
+
+    # Get the appropriate rate limit for this provider
+    if provider == 'openai':
+        rate_limit = NUM_ANALYSIS_OPENAI
+    else:
+        rate_limit = NUM_ANALYSIS_GROQ
 
     # Initialize for test message display
     current_count = 0
     limit = 0
 
-    # Check if analysis is blocked entirely (NUM_ANALYSIS=-1)
-    if NUM_ANALYSIS_PER_DAY == -1:
+    # Check if analysis is blocked entirely (rate_limit=-1)
+    if rate_limit == -1:
         return jsonify({
-            'error': 'AI analysis is currently disabled. Please contact the administrator.',
+            'error': f'{provider.upper()} AI analysis is currently disabled. Please contact the administrator.',
             'limit_reached': True,
             'current_count': 0,
             'limit': -1
         }), 429  # 429 Too Many Requests
 
-    # Check if analysis limit is enforced (NUM_ANALYSIS > 0)
-    if NUM_ANALYSIS_PER_DAY > 0:
+    # Check if analysis limit is enforced (rate_limit > 0)
+    if rate_limit > 0:
         # Use a lock to make check+log atomic and prevent race conditions
         with rate_limit_lock:
-            allowed, current_count, limit = check_analysis_limit(client_ip)
+            allowed, current_count, limit = check_analysis_limit(client_ip, provider)
             if not allowed:
                 return jsonify({
-                    'error': f'Daily analysis limit reached. You have used {current_count}/{limit} analyses today. Limit resets at midnight.',
+                    'error': f'Daily {provider.upper()} analysis limit reached. You have used {current_count}/{limit} {provider.upper()} analyses today. Limit resets at midnight.',
                     'limit_reached': True,
                     'current_count': current_count,
                     'limit': limit
@@ -608,9 +747,9 @@ def api_analyze_activity(activity_id):
             # Log the analysis request immediately within the lock
             # This ensures the count is incremented before the next request can check
             athlete_name = session.get('athlete_name', None)
-            log_analysis_request(client_ip, athlete_name, activity_id)
+            log_analysis_request(client_ip, athlete_name, activity_id, provider, selected_model)
     else:
-        # NUM_ANALYSIS=0 means unlimited
+        # rate_limit=0 means unlimited
         limit = 'unlimited'
 
     # Check if we're viewing a specific athlete's activities
@@ -630,13 +769,24 @@ def api_analyze_activity(activity_id):
 
     activity = resp.json()
 
-    # Analyze with OpenAI
+    # Analyze with selected provider (OpenAI or Groq)
     try:
-        openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        # Initialize appropriate client based on provider
+        if provider == 'openai':
+            llm_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        else:
+            llm_client = Groq(api_key=GROQ_API_KEY)
 
         # Define system prompts based on analysis mode
         if analysis_mode == 'maniac':
             system_prompt = """You are my over-achieving endurance coach in "maniac mode."
+
+CRITICAL - STRAVA API DATA FORMAT:
+- ALL distances in the JSON are in METERS (not miles or kilometers)
+- ALL elevations in the JSON are in METERS (not feet)
+- ALL speeds are in METERS PER SECOND
+- Times are in SECONDS
+- CONVERT TO US UNITS: meters ÷ 1609.34 = miles | meters ÷ 0.3048 = feet | (moving_time_sec / distance_m) × 26.8224 = min/mile
 
 Analyze this Strava activity with brutal honesty. Assume I want to be faster, stronger, and more disciplined than 99% of athletes.
 
@@ -661,12 +811,19 @@ Output format:
 - What a serious athlete would do differently next time
 - One non-negotiable action item for my next workout
 
-IMPORTANT: Use US units - miles (not kilometers), minutes per mile for pace (not min/km), feet for elevation (not meters).
+Display all metrics in US units (miles, feet, min/mile pace).
 
 Do not motivate me emotionally. Fix me."""
 
         elif analysis_mode == 'nice':
             system_prompt = """You are my supportive endurance coach in "nice guy mode."
+
+CRITICAL - STRAVA API DATA FORMAT:
+- ALL distances in the JSON are in METERS (not miles or kilometers)
+- ALL elevations in the JSON are in METERS (not feet)
+- ALL speeds are in METERS PER SECOND
+- Times are in SECONDS
+- CONVERT TO US UNITS: meters ÷ 1609.34 = miles | meters ÷ 0.3048 = feet | (moving_time_sec / distance_m) × 26.8224 = min/mile
 
 Analyze this Strava activity with a balanced, encouraging, and constructive tone. Assume I am committed and consistent, and I want to improve sustainably.
 
@@ -689,12 +846,19 @@ Output format:
 - One or two actionable suggestions for the next similar workout
 - What this workout contributes to my broader training
 
-IMPORTANT: Use US units - miles (not kilometers), minutes per mile for pace (not min/km), feet for elevation (not meters).
+Display all metrics in US units (miles, feet, min/mile pace).
 
 Keep it honest, but kind."""
 
         elif analysis_mode == 'nerd':
             system_prompt = """You are my sports science–oriented data analyst in "data nerd mode."
+
+CRITICAL - STRAVA API DATA FORMAT:
+- ALL distances in the JSON are in METERS (not miles or kilometers)
+- ALL elevations in the JSON are in METERS (not feet)
+- ALL speeds are in METERS PER SECOND
+- Times are in SECONDS
+- CONVERT TO US UNITS: meters ÷ 1609.34 = miles | meters ÷ 0.3048 = feet | (moving_time_sec / distance_m) × 26.8224 = min/mile
 
 Analyze this Strava activity purely through data, physiology, and execution quality. Assume I want objective insights, not motivation.
 
@@ -723,19 +887,33 @@ Output format:
 - Limitations of this analysis
 - One data-backed recommendation for future sessions
 
-IMPORTANT: Use US units - miles (not kilometers), minutes per mile for pace (not min/km), feet for elevation (not meters).
+Display all metrics in US units (miles, feet, min/mile pace).
 
 Do not coach emotionally. Let the data speak."""
 
         else:
             # Fallback for any unexpected mode
-            system_prompt = """You are a fitness data analyst. When analyzing activities:
-- Use US units: miles (not kilometers), minutes per mile for pace (not min/km)
-- Convert all distances to miles (1 km = 0.621371 miles)
-- Show pace in minutes per mile format (e.g., 8:30 min/mi)
-- Display splits in miles unless the activity has custom splits
-- Use feet for elevation (not meters)
-- Provide clear, actionable insights"""
+            system_prompt = """You are a fitness data analyst.
+
+CRITICAL - STRAVA API DATA FORMAT:
+- ALL distances in the JSON are in METERS (not miles or kilometers)
+- ALL elevations in the JSON are in METERS (not feet)
+- ALL speeds are in METERS PER SECOND (not mph or min/mile)
+- Times are in SECONDS
+
+REQUIRED CONVERSIONS FOR YOUR ANALYSIS:
+- Distance: divide meters by 1609.34 to get miles
+- Elevation: divide meters by 0.3048 to get feet
+- Pace: (moving_time_seconds / distance_meters) * 26.8224 = minutes per mile
+- Speed: multiply meters/second by 2.23694 to get mph
+
+OUTPUT FORMAT - USE US UNITS:
+- Display all distances in MILES (e.g., "5.2 miles")
+- Display all elevations in FEET (e.g., "450 feet")
+- Display pace in MINUTES PER MILE (e.g., "8:30 min/mi")
+- Display splits in miles unless the activity has custom kilometer splits
+
+Provide clear, actionable insights based on properly converted data."""
 
         prompt = f"Analyze this Strava activity in detail: {activity}"
         if training_intent:
@@ -744,16 +922,72 @@ Do not coach emotionally. Let the data speak."""
         if analysis_query:
             prompt += f"\nFocus on: {analysis_query}"
 
-        # Call OpenAI API for actual analysis
-        response = openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        analysis = response.choices[0].message.content.strip()
-        analysis_html = markdown2.markdown(analysis)
+        # Check if debug mode is enabled
+        if DEBUG_SKIP_LLM:
+            # Save prompt to file instead of calling OpenAI
+            import os as debug_os
+
+            # Create debug_prompts directory if it doesn't exist
+            debug_dir = 'debug_prompts'
+            debug_os.makedirs(debug_dir, exist_ok=True)
+
+            # Generate filename with timestamp
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f'prompt_{timestamp}_activity_{activity_id}.txt'
+            filepath = debug_os.path.join(debug_dir, filename)
+
+            # Write prompt to file
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write("=" * 80 + "\n")
+                f.write("DEBUG MODE: LLM Call Skipped - Prompt Saved to File\n")
+                f.write("=" * 80 + "\n\n")
+                f.write(f"Activity ID: {activity_id}\n")
+                f.write(f"Analysis Mode: {analysis_mode}\n")
+                f.write(f"Training Intent: {training_intent or 'Not specified'}\n")
+                f.write(f"Analysis Query: {analysis_query or 'Not specified'}\n")
+                f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("\n" + "=" * 80 + "\n")
+                f.write("SYSTEM PROMPT\n")
+                f.write("=" * 80 + "\n\n")
+                f.write(system_prompt)
+                f.write("\n\n" + "=" * 80 + "\n")
+                f.write("USER PROMPT\n")
+                f.write("=" * 80 + "\n\n")
+                f.write(prompt)
+                f.write("\n\n" + "=" * 80 + "\n")
+                f.write("END OF PROMPT\n")
+                f.write("=" * 80 + "\n")
+
+            print(f"DEBUG MODE: Prompt saved to {filepath}")
+
+            # Return response with file path
+            analysis = f"""# Debug Mode - LLM Call Skipped
+
+**Analysis Mode:** {analysis_mode}
+**Training Intent:** {training_intent or 'Not specified'}
+**Analysis Query:** {analysis_query or 'Not specified'}
+
+The actual LLM call was skipped because `DEBUG_SKIP_LLM` is enabled.
+
+**Prompt saved to:** `{filepath}`
+
+You can open this file to see the exact system prompt and user prompt that would have been sent to the LLM.
+
+To make actual API calls, set `DEBUG_SKIP_LLM=false` in your .env file.
+"""
+            analysis_html = markdown2.markdown(analysis)
+        else:
+            # Call LLM API (OpenAI or Groq based on selected model)
+            response = llm_client.chat.completions.create(
+                model=selected_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ]
+            )
+
+            analysis = response.choices[0].message.content.strip()
+            analysis_html = markdown2.markdown(analysis)
 
         return jsonify({
             'success': True,
@@ -761,7 +995,7 @@ Do not coach emotionally. Let the data speak."""
             'analysis_html': analysis_html
         })
     except Exception as e:
-        return jsonify({'error': f'OpenAI API error: {str(e)}'}), 500
+        return jsonify({'error': f'LLM API error: {str(e)}'}), 500
 
 @app.route('/analyze_list', methods=['GET', 'POST'])
 def analyze_list():
@@ -818,30 +1052,105 @@ def analyze_list():
             'total_time': seconds_to_hms(total_time)
         }
     elif request.method == 'POST' or 'analyze_list' in request.args:
-        openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
-        system_prompt = """You are a fitness data analyst. When analyzing activities:
-- Use US units: miles (not kilometers), minutes per mile for pace (not min/km)
-- Convert all distances to miles (1 km = 0.621371 miles)
-- Show pace in minutes per mile format (e.g., 8:30 min/mi)
-- Display splits in miles unless the activity has custom splits
-- Use feet for elevation (not meters)
-- Provide clear, actionable insights and trends across all activities"""
+        # Use default model (prefer Groq if available)
+        provider = get_model_provider(DEFAULT_MODEL)
+
+        # Initialize appropriate client
+        if provider == 'openai':
+            llm_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        else:
+            llm_client = Groq(api_key=GROQ_API_KEY)
+
+        system_prompt = """You are a fitness data analyst.
+
+CRITICAL - STRAVA API DATA FORMAT:
+- ALL distances in the JSON are in METERS (not miles or kilometers)
+- ALL elevations in the JSON are in METERS (not feet)
+- ALL speeds are in METERS PER SECOND (not mph or min/mile)
+- Times are in SECONDS
+
+REQUIRED CONVERSIONS FOR YOUR ANALYSIS:
+- Distance: divide meters by 1609.34 to get miles
+- Elevation: divide meters by 0.3048 to get feet
+- Pace: (moving_time_seconds / distance_meters) * 26.8224 = minutes per mile
+- Speed: multiply meters/second by 2.23694 to get mph
+
+OUTPUT FORMAT - USE US UNITS:
+- Display all distances in MILES (e.g., "5.2 miles")
+- Display all elevations in FEET (e.g., "450 feet")
+- Display pace in MINUTES PER MILE (e.g., "8:30 min/mi")
+- Display splits in miles unless the activity has custom kilometer splits
+
+Provide clear, actionable insights and trends across all activities based on properly converted data."""
 
         prompt = f"Analyze this list of Strava activities: {activities}"
         if analysis_query:
             prompt += f"\nFocus on: {analysis_query}"
         try:
-            response = openai_client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            analysis = response.choices[0].message.content.strip()
-            analysis_html = markdown2.markdown(analysis)
+            # Check if debug mode is enabled
+            if DEBUG_SKIP_LLM:
+                # Save prompt to file instead of calling OpenAI
+                import os as debug_os
+
+                # Create debug_prompts directory if it doesn't exist
+                debug_dir = 'debug_prompts'
+                debug_os.makedirs(debug_dir, exist_ok=True)
+
+                # Generate filename with timestamp
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                filename = f'prompt_{timestamp}_list_analysis.txt'
+                filepath = debug_os.path.join(debug_dir, filename)
+
+                # Write prompt to file
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    f.write("=" * 80 + "\n")
+                    f.write("DEBUG MODE: LLM Call Skipped - Prompt Saved to File\n")
+                    f.write("=" * 80 + "\n\n")
+                    f.write(f"Analysis Type: List Analysis\n")
+                    f.write(f"Analysis Query: {analysis_query or 'Not specified'}\n")
+                    f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write("\n" + "=" * 80 + "\n")
+                    f.write("SYSTEM PROMPT\n")
+                    f.write("=" * 80 + "\n\n")
+                    f.write(system_prompt)
+                    f.write("\n\n" + "=" * 80 + "\n")
+                    f.write("USER PROMPT\n")
+                    f.write("=" * 80 + "\n\n")
+                    f.write(prompt)
+                    f.write("\n\n" + "=" * 80 + "\n")
+                    f.write("END OF PROMPT\n")
+                    f.write("=" * 80 + "\n")
+
+                print(f"DEBUG MODE: Prompt saved to {filepath}")
+
+                # Return response with file path
+                analysis = f"""# Debug Mode - LLM Call Skipped
+
+**Analysis Query:** {analysis_query or 'Not specified'}
+
+This is a mock response for list analysis. The actual LLM call was skipped because `DEBUG_SKIP_LLM` is enabled.
+
+**Prompt saved to:** `{filepath}`
+
+You can open this file to see the exact system prompt and user prompt that would have been sent to the LLM.
+
+To make actual API calls, set `DEBUG_SKIP_LLM=false` in your .env file.
+"""
+                analysis_html = markdown2.markdown(analysis)
+            else:
+                # Call LLM API (OpenAI or Groq)
+                response = llm_client.chat.completions.create(
+                    model=DEFAULT_MODEL,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+
+                analysis = response.choices[0].message.content.strip()
+                analysis_html = markdown2.markdown(analysis)
         except Exception as e:
-            analysis = f'OpenAI API error: {e}'
+            analysis = f'LLM API error: {e}'
     return render_template('list_analysis.html', activities=activities, analysis=analysis, analysis_html=analysis_html, analysis_query=analysis_query, summary=summary)
 
 @app.route('/select', methods=['GET', 'POST'])
@@ -870,7 +1179,12 @@ def select_activity():
                 act['distance_miles'] = round(act['distance'] / 1609.34, 2)
             if 'moving_time' in act and act.get('distance_miles', 0) > 0:
                 act['pace_min_per_mile'] = round((act['moving_time'] / 60) / act['distance_miles'], 2)
-        return render_template('select.html', activities=activities, analysis_query=analysis_query)
+        return render_template('select.html',
+                             activities=activities,
+                             analysis_query=analysis_query,
+                             groq_models=GROQ_MODELS,
+                             openai_models=OPENAI_MODELS,
+                             default_model=DEFAULT_MODEL)
     activity_id = request.form.get('activity_id')
     analysis_query = request.form.get('analysis_query', '').strip()
     if analysis_query:
@@ -938,7 +1252,13 @@ def select_activity():
             'activity_types': sorted_types,
             'rows': summary_rows
         }
-        return render_template('select.html', activities=activities, analysis_query=analysis_query, summary=summary)
+        return render_template('select.html',
+                             activities=activities,
+                             analysis_query=analysis_query,
+                             summary=summary,
+                             groq_models=GROQ_MODELS,
+                             openai_models=OPENAI_MODELS,
+                             default_model=DEFAULT_MODEL)
     return redirect(url_for('activity_detail', activity_id=activity_id))
 
 @app.route('/athletes')
@@ -1059,7 +1379,13 @@ def fetch_athlete_activities(athlete_name):
                              athlete_name=athlete_name,
                              error='No activities found for this date range.')
 
-    return render_template('select.html', activities=activities, analysis_query=analysis_query, athlete_name=athlete_name)
+    return render_template('select.html',
+                         activities=activities,
+                         analysis_query=analysis_query,
+                         athlete_name=athlete_name,
+                         groq_models=GROQ_MODELS,
+                         openai_models=OPENAI_MODELS,
+                         default_model=DEFAULT_MODEL)
 
 if __name__ == '__main__':
     app.run(debug=True, port=4200, host='localhost')

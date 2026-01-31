@@ -1,6 +1,7 @@
 Flask
 requests
 python-dotenv
+groq
 openai
 bootstrap-flask
 markdown2
