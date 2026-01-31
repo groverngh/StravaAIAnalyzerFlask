@@ -8,10 +8,14 @@ from urllib.parse import urlencode
 import markdown2
 import json
 import time
+import threading
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 load_dotenv()
+
+# Global lock for rate limiting to prevent race conditions
+rate_limit_lock = threading.Lock()
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
@@ -23,11 +27,13 @@ STRAVA_CLIENT_ID = os.getenv('STRAVA_CLIENT_ID')
 STRAVA_CLIENT_SECRET = os.getenv('STRAVA_CLIENT_SECRET')
 STRAVA_REDIRECT_URI = os.getenv('STRAVA_REDIRECT_URI', 'http://localhost:4200/callback')
 OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-5.1')
+NUM_ANALYSIS_PER_DAY = int(os.getenv('NUM_ANALYSIS', '0'))  # 0 = unlimited
 TOKEN_FILE = 'token_store.json'
 GOOGLE_SHEETS_CREDENTIALS_FILE = 'njmaniacs-485422-8e16104bb447.json'
 GOOGLE_SHEET_ID = '1POa75jrHHYwyfBAC0aObgc01HEFPnjl7ongLAJhqfa0'
 GOOGLE_SHEET_NAME = 'Sheet1'
 ATHLETE_CREDS_SHEET_NAME = 'Athelete'
+AI_ANALYSIS_SHEET_NAME = 'AI Analysis'
 
 # Token management functions
 def save_tokens(access_token, refresh_token, expires_at):
@@ -264,6 +270,123 @@ def update_athlete_tokens(row_number, access_token, refresh_token, expires_at):
         print(f"Error updating athlete tokens: {e}")
         return False
 
+def get_client_ip():
+    """Get client IP address, handling proxies"""
+    if request.headers.get('X-Forwarded-For'):
+        # Get the first IP in the X-Forwarded-For chain (client IP)
+        ip = request.headers.get('X-Forwarded-For').split(',')[0].strip()
+    elif request.headers.get('X-Real-IP'):
+        ip = request.headers.get('X-Real-IP')
+    else:
+        ip = request.remote_addr
+    return ip
+
+def check_analysis_limit(ip_address):
+    """Check if IP address has exceeded daily analysis limit
+
+    Args:
+        ip_address (str): Client IP address
+
+    Returns:
+        tuple: (allowed (bool), count (int), limit (int))
+    """
+    # If limit is -1, block all analyses
+    if NUM_ANALYSIS_PER_DAY == -1:
+        return False, 0, -1
+
+    # If limit is 0, unlimited analyses allowed
+    if NUM_ANALYSIS_PER_DAY == 0:
+        return True, 0, 0
+
+    try:
+        service = get_sheets_service(readonly=True)
+
+        # Fetch data from AI Analysis sheet
+        sheet = service.spreadsheets()
+        result = sheet.values().get(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            range=f'{AI_ANALYSIS_SHEET_NAME}!A:D'
+        ).execute()
+
+        values = result.get('values', [])
+        if not values:
+            # No data yet, allow analysis
+            return True, 0, NUM_ANALYSIS_PER_DAY
+
+        # Get today's date
+        today = datetime.now().strftime('%Y-%m-%d')
+
+        # Count analyses for this IP today
+        count = 0
+        for row in values[1:]:  # Skip header row (row 0)
+            if len(row) >= 3:
+                row_ip = row[0] if len(row) > 0 else ''
+                row_date = row[2] if len(row) > 2 else ''
+
+                if row_ip == ip_address and row_date == today:
+                    count += 1
+
+        # Debug logging
+        print(f"[Rate Limit Check] IP: {ip_address}, Date: {today}, Count: {count}, Limit: {NUM_ANALYSIS_PER_DAY}")
+        print(f"[Rate Limit Check] Total rows in sheet: {len(values)}, Data rows: {len(values)-1}")
+
+        # Check if limit would be exceeded
+        # count represents analyses ALREADY completed
+        # If count >= limit, we've used our quota, so block
+        allowed = count < NUM_ANALYSIS_PER_DAY
+
+        print(f"[Rate Limit Check] Allowed: {allowed} (count {count} < limit {NUM_ANALYSIS_PER_DAY})")
+
+        return allowed, count, NUM_ANALYSIS_PER_DAY
+
+    except Exception as e:
+        print(f"Error checking analysis limit: {e}")
+        # On error, block the analysis (fail closed) to prevent abuse
+        return False, 0, NUM_ANALYSIS_PER_DAY
+
+def log_analysis_request(ip_address, athlete_name=None, activity_id=None):
+    """Log analysis request to Google Sheets
+
+    Args:
+        ip_address (str): Client IP address
+        athlete_name (str, optional): Athlete name if logged in
+        activity_id (str, optional): Activity ID analyzed
+    """
+    try:
+        service = get_sheets_service(readonly=False)
+
+        # Get current timestamp
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        date = datetime.now().strftime('%Y-%m-%d')
+
+        # Prepare row data
+        values = [[
+            ip_address,
+            timestamp,
+            date,
+            athlete_name or 'Unknown',
+            str(activity_id) if activity_id else ''
+        ]]
+
+        body = {
+            'values': values
+        }
+
+        # Append to AI Analysis sheet
+        result = service.spreadsheets().values().append(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            range=f'{AI_ANALYSIS_SHEET_NAME}!A:E',
+            valueInputOption='RAW',
+            insertDataOption='INSERT_ROWS',
+            body=body
+        ).execute()
+
+        print(f"[Rate Limit Log] Successfully logged: IP={ip_address}, Date={date}, Athlete={athlete_name}, Activity={activity_id}")
+        return True
+    except Exception as e:
+        print(f"Error logging analysis request: {e}")
+        return False
+
 def get_athlete_token(athlete_name):
     """Get valid token for a specific athlete, refreshing if necessary"""
     creds = get_athlete_credentials(athlete_name)
@@ -448,6 +571,48 @@ def activity_detail(activity_id):
 @app.route('/api/analyze_activity/<int:activity_id>', methods=['POST'])
 def api_analyze_activity(activity_id):
     """API endpoint for analyzing a single activity with detailed data"""
+    # Get client IP address
+    client_ip = get_client_ip()
+
+    # Get analysis mode and training intent from request body (nerd, maniac, or nice)
+    request_data = request.get_json() or {}
+    analysis_mode = request_data.get('mode', 'nerd')
+    training_intent = request_data.get('training_intent', '')
+
+    # Initialize for test message display
+    current_count = 0
+    limit = 0
+
+    # Check if analysis is blocked entirely (NUM_ANALYSIS=-1)
+    if NUM_ANALYSIS_PER_DAY == -1:
+        return jsonify({
+            'error': 'AI analysis is currently disabled. Please contact the administrator.',
+            'limit_reached': True,
+            'current_count': 0,
+            'limit': -1
+        }), 429  # 429 Too Many Requests
+
+    # Check if analysis limit is enforced (NUM_ANALYSIS > 0)
+    if NUM_ANALYSIS_PER_DAY > 0:
+        # Use a lock to make check+log atomic and prevent race conditions
+        with rate_limit_lock:
+            allowed, current_count, limit = check_analysis_limit(client_ip)
+            if not allowed:
+                return jsonify({
+                    'error': f'Daily analysis limit reached. You have used {current_count}/{limit} analyses today. Limit resets at midnight.',
+                    'limit_reached': True,
+                    'current_count': current_count,
+                    'limit': limit
+                }), 429  # 429 Too Many Requests
+
+            # Log the analysis request immediately within the lock
+            # This ensures the count is incremented before the next request can check
+            athlete_name = session.get('athlete_name', None)
+            log_analysis_request(client_ip, athlete_name, activity_id)
+    else:
+        # NUM_ANALYSIS=0 means unlimited
+        limit = 'unlimited'
+
     # Check if we're viewing a specific athlete's activities
     token = session.get('athlete_token')
     if not token:
@@ -468,7 +633,103 @@ def api_analyze_activity(activity_id):
     # Analyze with OpenAI
     try:
         openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
-        system_prompt = """You are a fitness data analyst. When analyzing activities:
+
+        # Define system prompts based on analysis mode
+        if analysis_mode == 'maniac':
+            system_prompt = """You are my over-achieving endurance coach in "maniac mode."
+
+Analyze this Strava activity with brutal honesty. Assume I want to be faster, stronger, and more disciplined than 99% of athletes.
+
+Rules:
+- Be blunt, direct, and unsympathetic to excuses
+- Call out inefficiencies, laziness, poor pacing, weak execution, and missed opportunities
+- Point out where I left performance on the table
+- If something was good, acknowledge it briefly, then push for a higher standard
+- Compare my execution against what an elite amateur or competitive age-grouper would do
+
+Analyze:
+- Pacing discipline (splits, variability, fade)
+- Effort vs outcome (did I earn the result?)
+- Training intent vs actual execution
+- Strengths I am under-leveraging
+- Specific, uncomfortable improvements I must make
+
+Output format:
+- One-sentence harsh summary
+- What I did wrong (bullet points, no sugarcoating)
+- What I did right (short)
+- What a serious athlete would do differently next time
+- One non-negotiable action item for my next workout
+
+IMPORTANT: Use US units - miles (not kilometers), minutes per mile for pace (not min/km), feet for elevation (not meters).
+
+Do not motivate me emotionally. Fix me."""
+
+        elif analysis_mode == 'nice':
+            system_prompt = """You are my supportive endurance coach in "nice guy mode."
+
+Analyze this Strava activity with a balanced, encouraging, and constructive tone. Assume I am committed and consistent, and I want to improve sustainably.
+
+Guidelines:
+- Start with what went well and why it matters
+- Frame weaknesses as opportunities, not failures
+- Focus on learning and long-term progression
+- Avoid harsh language or shaming
+
+Analyze:
+- Overall effort and pacing quality
+- Alignment with training intent
+- Signs of improving fitness or durability
+- Small adjustments that could make this workout better next time
+
+Output format:
+- Positive summary of the session
+- Key strengths from this activity
+- Areas to gently improve
+- One or two actionable suggestions for the next similar workout
+- What this workout contributes to my broader training
+
+IMPORTANT: Use US units - miles (not kilometers), minutes per mile for pace (not min/km), feet for elevation (not meters).
+
+Keep it honest, but kind."""
+
+        elif analysis_mode == 'nerd':
+            system_prompt = """You are my sports science–oriented data analyst in "data nerd mode."
+
+Analyze this Strava activity purely through data, physiology, and execution quality. Assume I want objective insights, not motivation.
+
+Rules:
+- Be precise, quantitative, and evidence-based
+- Avoid hype, emotion, or moral judgment
+- If data is missing, state assumptions explicitly
+- Distinguish correlation vs causation
+
+Analyze:
+- Pacing metrics (splits, variance, coefficient of variation if possible)
+- Intensity distribution (time in zones, HR–pace decoupling, drift)
+- Efficiency indicators (pace vs HR, cadence trends, stride consistency if available)
+- Fatigue signals (late-run fade, HR drift, power drop if applicable)
+- Execution vs stated training intent
+
+Derived insights:
+- What this workout implies about current fitness
+- Whether this session was optimally stressful, undercooked, or excessive
+- What adaptations this workout is likely to drive
+
+Output format:
+- Data summary (key metrics only)
+- Observed patterns and anomalies
+- Interpretation (what the data suggests, with confidence level)
+- Limitations of this analysis
+- One data-backed recommendation for future sessions
+
+IMPORTANT: Use US units - miles (not kilometers), minutes per mile for pace (not min/km), feet for elevation (not meters).
+
+Do not coach emotionally. Let the data speak."""
+
+        else:
+            # Fallback for any unexpected mode
+            system_prompt = """You are a fitness data analyst. When analyzing activities:
 - Use US units: miles (not kilometers), minutes per mile for pace (not min/km)
 - Convert all distances to miles (1 km = 0.621371 miles)
 - Show pace in minutes per mile format (e.g., 8:30 min/mi)
@@ -477,9 +738,13 @@ def api_analyze_activity(activity_id):
 - Provide clear, actionable insights"""
 
         prompt = f"Analyze this Strava activity in detail: {activity}"
+        if training_intent:
+            prompt += f"\n\nStated training intent: {training_intent}"
+            prompt += "\nEvaluate whether the execution matched the stated training intent."
         if analysis_query:
             prompt += f"\nFocus on: {analysis_query}"
 
+        # Call OpenAI API for actual analysis
         response = openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[

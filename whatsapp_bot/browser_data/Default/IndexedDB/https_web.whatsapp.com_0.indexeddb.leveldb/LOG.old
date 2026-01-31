@@ -1,0 +1,16 @@
+2026/01/30-15:36:55.290 41fdc9 Reusing MANIFEST /Users/neerajgrover/Projects/StravaAIAnalyzerFlask/whatsapp_bot/browser_data/Default/IndexedDB/https_web.whatsapp.com_0.indexeddb.leveldb/MANIFEST-000001
+2026/01/30-15:36:55.292 41fdc9 Recovering log #58
+2026/01/30-15:36:55.301 41fdc9 Reusing old log /Users/neerajgrover/Projects/StravaAIAnalyzerFlask/whatsapp_bot/browser_data/Default/IndexedDB/https_web.whatsapp.com_0.indexeddb.leveldb/000058.log 
+2026/01/30-15:37:04.551 41fdca Level-0 table #65: started
+2026/01/30-15:37:04.565 41fdca Level-0 table #65: 1132868 bytes OK
+2026/01/30-15:37:04.568 41fdca Delete type=0 #58
+2026/01/30-15:37:04.569 41fdca Compacting 1@1 + 3@2 files
+2026/01/30-15:37:04.606 41fdca Generated table #66@1: 53392 keys, 2216696 bytes
+2026/01/30-15:37:04.630 41fdca Generated table #67@1: 24446 keys, 2198821 bytes
+2026/01/30-15:37:04.645 41fdca Generated table #68@1: 29227 keys, 1148404 bytes
+2026/01/30-15:37:04.645 41fdca Compacted 1@1 + 3@2 files => 5563921 bytes
+2026/01/30-15:37:04.647 41fdca compacted to: files[ 0 0 3 0 0 0 0 ]
+2026/01/30-15:37:04.648 41fdca Delete type=2 #62
+2026/01/30-15:37:04.648 41fdca Delete type=2 #61
+2026/01/30-15:37:04.648 41fdca Delete type=2 #60
+2026/01/30-15:37:04.648 41fdca Delete type=2 #65
