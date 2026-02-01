@@ -24,28 +24,250 @@
 </div>
 {% endif %}
 
-<div class="card">
-    <div class="card-body">
-        <h5 class="card-title">Fetch Activities</h5>
-        <form method="post" action="{{ url_for('fetch_athlete_activities', athlete_name=athlete_name) }}">
-            <div class="mb-3" onclick="if(document.getElementById('date').showPicker){document.getElementById('date').showPicker();}else{document.getElementById('date').focus();}">
-                <label for="date" class="form-label">Date (or start date)</label>
-                <input type="date" class="form-control" id="date" name="date" required onchange="this.blur();">
+<div class="row">
+    <div class="col-md-6 mb-3">
+        <div class="card h-100">
+            <div class="card-body">
+                <h5 class="card-title">Fetch Activities from Strava</h5>
+                <p class="text-muted small">Pull activities from your connected Strava account</p>
+                <form method="post" action="{{ url_for('fetch_athlete_activities', athlete_name=athlete_name) }}">
+                    <div class="mb-3" onclick="if(document.getElementById('date').showPicker){document.getElementById('date').showPicker();}else{document.getElementById('date').focus();}">
+                        <label for="date" class="form-label">Date (or start date)</label>
+                        <input type="date" class="form-control" id="date" name="date" required onchange="this.blur();">
+                    </div>
+                    <div class="mb-3" onclick="if(document.getElementById('end_date').showPicker){document.getElementById('end_date').showPicker();}else{document.getElementById('end_date').focus();}">
+                        <label for="end_date" class="form-label">End Date (optional)</label>
+                        <input type="date" class="form-control" id="end_date" name="end_date" onchange="this.blur();">
+                    </div>
+                    <div class="mb-3">
+                        <label for="analysis_query" class="form-label">What do you want to analyze? (optional)</label>
+                        <input type="text" class="form-control" id="analysis_query" name="analysis_query" placeholder="e.g. performance, heart rate, calories">
+                    </div>
+                    <button type="submit" class="btn btn-primary">Fetch Activities</button>
+                </form>
             </div>
-            <div class="mb-3" onclick="if(document.getElementById('end_date').showPicker){document.getElementById('end_date').showPicker();}else{document.getElementById('end_date').focus();}">
-                <label for="end_date" class="form-label">End Date (optional)</label>
-                <input type="date" class="form-control" id="end_date" name="end_date" onchange="this.blur();">
+        </div>
+    </div>
+
+    <div class="col-md-6 mb-3">
+        <div class="card h-100">
+            <div class="card-body">
+                <h5 class="card-title">Upload FIT File</h5>
+                <p class="text-muted small">Analyze activity from a .fit file (Garmin, Wahoo, etc.)</p>
+                <form method="post" action="{{ url_for('upload_fit_file', athlete_name=athlete_name) }}" enctype="multipart/form-data" id="fit-upload-form">
+                    <div class="mb-3">
+                        <label for="fit_file" class="form-label">Select FIT File</label>
+                        <input type="file" class="form-control" id="fit_file" name="fit_file" accept=".fit" required>
+                        <div class="form-text">Max file size: 50 MB</div>
+                    </div>
+                    <div class="mb-3">
+                        <label for="activity_name" class="form-label">Activity Name (optional)</label>
+                        <input type="text" class="form-control" id="activity_name" name="activity_name" placeholder="e.g. Morning Run">
+                    </div>
+                    <button type="submit" class="btn btn-success">
+                        <span id="upload-btn-text">Upload & Analyze</span>
+                        <span id="upload-spinner" class="spinner-border spinner-border-sm ms-2" role="status" style="display:none;"></span>
+                    </button>
+                </form>
             </div>
-            <div class="mb-3">
-                <label for="analysis_query" class="form-label">What do you want to analyze? (optional)</label>
-                <input type="text" class="form-control" id="analysis_query" name="analysis_query" placeholder="e.g. performance, heart rate, calories">
-            </div>
-            <button type="submit" class="btn btn-primary">Fetch Activities</button>
-        </form>
+        </div>
     </div>
 </div>
+
+<script>
+// Show loading spinner on FIT file upload
+document.getElementById('fit-upload-form').addEventListener('submit', function() {
+    document.getElementById('upload-btn-text').textContent = 'Uploading...';
+    document.getElementById('upload-spinner').style.display = 'inline-block';
+});
+</script>
 
 {% if error %}
 <div class="alert alert-danger mt-3">{{ error }}</div>
 {% endif %}
+
+{% if fit_activity %}
+<div class="card mt-4">
+    <div class="card-body">
+        <h5 class="card-title">Uploaded Activity: {{ fit_activity.name }}</h5>
+        <div class="row mb-3">
+            <div class="col-md-3">
+                <strong>Type:</strong> {{ fit_activity.type }}
+            </div>
+            <div class="col-md-3">
+                <strong>Distance:</strong> {{ fit_activity.distance_miles }} miles
+            </div>
+            <div class="col-md-3">
+                <strong>Pace:</strong> {{ fit_activity.pace_min_per_mile }}
+            </div>
+            <div class="col-md-3">
+                <strong>Date:</strong> {{ fit_activity.start_date_local[:10] if fit_activity.start_date_local else 'N/A' }}
+            </div>
+        </div>
+
+        <!-- Analysis Mode Selection -->
+        <div class="mb-3">
+            <label for="training-intent-fit" class="form-label fw-bold">Training Intent:</label>
+            <select class="form-select" id="training-intent-fit" onchange="toggleCustomIntentFit()">
+                <option value="aerobic base">Aerobic Base</option>
+                <option value="long run">Long Run</option>
+                <option value="race simulation">Race Simulation</option>
+                <option value="recovery">Recovery</option>
+                <option value="threshold">Threshold</option>
+                <option value="custom" selected>Custom</option>
+            </select>
+        </div>
+
+        <!-- Custom Training Intent Input (hidden by default) -->
+        <div class="mb-3" id="custom-intent-container-fit" style="display:none;">
+            <label for="custom-intent-input-fit" class="form-label fw-bold">Custom Training Intent:</label>
+            <textarea class="form-control" id="custom-intent-input-fit" rows="3" placeholder="Describe your training goal and what you want the AI to focus on (e.g., 'Negative split practice - analyze pacing strategy and execution')"></textarea>
+            <small class="form-text text-muted">Be specific about your goal and what aspects you want analyzed.</small>
+        </div>
+
+         <!-- Model Selection -->
+         <div class="mb-4">
+            <label for="llm-model" class="form-label fw-bold">AI Model:</label>
+            <select class="form-select" id="llm-model">
+              <!-- Groq Models -->
+              {% if groq_models %}
+              <optgroup label="Groq Models">
+              {% for model in groq_models %}
+                <option value="{{ model }}" {% if model == default_model %}selected{% endif %}>{{ model }}</option>
+              {% endfor %}
+              </optgroup>
+              {% endif %}
+  
+              <!-- OpenAI Models -->
+              {% if openai_models %}
+              <optgroup label="OpenAI Models">
+              {% for model in openai_models %}
+                <option value="{{ model }}" {% if model == default_model %}selected{% endif %}>{{ model }}</option>
+              {% endfor %}
+              </optgroup>
+              {% endif %}
+  
+              <!-- Gemini Models -->
+              {% if gemini_models %}
+              <optgroup label="Google Gemini Models">
+              {% for model in gemini_models %}
+                <option value="{{ model }}" {% if model == default_model %}selected{% endif %}>{{ model }}</option>
+              {% endfor %}
+              </optgroup>
+              {% endif %}
+            </select>
+          </div>
+
+        <div class="mb-3">
+            <label class="form-label fw-bold">Select Analysis Mode:</label>
+            <div class="d-grid gap-2">
+                <button type="button" class="btn btn-outline-secondary" onclick="analyzeFitActivity('nerd')">
+                    <strong>Nerd Mode 🤓</strong> - Data-driven analysis
+                </button>
+                <button type="button" class="btn btn-outline-danger" onclick="analyzeFitActivity('maniac')">
+                    <strong>Maniac Mode 🔥</strong> - Brutal honesty
+                </button>
+                <button type="button" class="btn btn-outline-success" onclick="analyzeFitActivity('nice')">
+                    <strong>Nice Coach Mode 😊</strong> - Supportive feedback
+                </button>
+            </div>
+        </div>
+
+        <!-- Loading Spinner -->
+        <div id="fit-loading" class="text-center my-3" style="display:none;">
+            <div class="spinner-border text-primary" role="status">
+                <span class="visually-hidden">Loading...</span>
+            </div>
+            <p class="mt-2">Analyzing your activity with AI...</p>
+        </div>
+
+        <!-- Analysis Results -->
+        <div id="fit-analysis-results" class="mt-3" style="display:none;">
+            <h6>Analysis Results:</h6>
+            <div id="fit-analysis-content" class="p-3 bg-light border rounded"></div>
+        </div>
+    </div>
+</div>
+
+<script>
+
+var currentActivityId = null;
+
+  function toggleCustomIntentFit() {
+    var intentSelect = document.getElementById('training-intent-fit');
+    var customContainer = document.getElementById('custom-intent-container-fit');
+
+    if (intentSelect.value === 'custom') {
+      customContainer.style.display = 'block';
+    } else {
+      customContainer.style.display = 'none';
+    }
+  }
+
+function analyzeFitActivity(mode) {
+    // Get selected training intent and model
+    var trainingIntentSelect = document.getElementById('training-intent-fit').value;
+    var trainingIntent = trainingIntentSelect;
+
+    // If custom is selected, use the custom input value
+    if (trainingIntentSelect === 'custom') {
+      var customInput = document.getElementById('custom-intent-input-fit').value.trim();
+      if (!customInput) {
+        alert('Please enter your custom training intent.');
+        return;
+      }
+      trainingIntent = customInput;
+    }
+
+    var activityId = '{{ fit_activity.id }}';
+
+    //read the model
+    var llmModel = document.getElementById('llm-model').value;
+
+    // Show loading spinner
+    document.getElementById('fit-loading').style.display = 'block';
+    document.getElementById('fit-analysis-results').style.display = 'none';
+
+    // Make AJAX request to analyze endpoint
+    fetch('/api/analyze_activity/' + activityId, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            mode: mode,
+            training_intent: trainingIntent,
+            model: llmModel
+        })
+    })
+    .then(response => response.json())
+    .then(data => {
+        // Hide loading spinner
+        document.getElementById('fit-loading').style.display = 'none';
+
+        if (data.error) {
+            // Show error
+            document.getElementById('fit-analysis-content').innerHTML =
+                '<div class="alert alert-danger">' + data.error + '</div>';
+            document.getElementById('fit-analysis-results').style.display = 'block';
+        } else if (data.success) {
+            // Show analysis results
+            document.getElementById('fit-analysis-content').innerHTML = data.analysis_html;
+            document.getElementById('fit-analysis-results').style.display = 'block';
+        }
+    })
+    .catch(error => {
+        // Hide loading spinner
+        document.getElementById('fit-loading').style.display = 'none';
+        // Show error
+        document.getElementById('fit-analysis-content').innerHTML =
+            '<div class="alert alert-danger">Error: ' + error.message + '</div>';
+        document.getElementById('fit-analysis-results').style.display = 'block';
+    });
+}
+
+toggleCustomIntentFit();
+</script>
+{% endif %}
+
 {% endblock %}

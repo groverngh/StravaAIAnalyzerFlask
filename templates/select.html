@@ -101,13 +101,21 @@ function downloadSummaryCSV() {
         <!-- Training Intent Selection -->
         <div class="mb-4">
           <label for="training-intent" class="form-label fw-bold">Training Intent:</label>
-          <select class="form-select" id="training-intent">
+          <select class="form-select" id="training-intent" onchange="toggleCustomIntent()">
             <option value="aerobic base">Aerobic Base</option>
             <option value="long run">Long Run</option>
             <option value="race simulation">Race Simulation</option>
             <option value="recovery">Recovery</option>
             <option value="threshold">Threshold</option>
+            <option value="custom" selected>Custom</option>
           </select>
+        </div>
+
+        <!-- Custom Training Intent Input (hidden by default) -->
+        <div class="mb-4" id="custom-intent-container" style="display:none;">
+          <label for="custom-intent-input" class="form-label fw-bold">Custom Training Intent:</label>
+          <textarea class="form-control" id="custom-intent-input" rows="3" placeholder="Describe your training goal and what you want the AI to focus on (e.g., 'Negative split practice - analyze pacing strategy and execution')"></textarea>
+          <small class="form-text text-muted">Be specific about your goal and what aspects you want analyzed.</small>
         </div>
 
         <!-- Model Selection -->
@@ -127,6 +135,15 @@ function downloadSummaryCSV() {
             {% if openai_models %}
             <optgroup label="OpenAI Models">
             {% for model in openai_models %}
+              <option value="{{ model }}" {% if model == default_model %}selected{% endif %}>{{ model }}</option>
+            {% endfor %}
+            </optgroup>
+            {% endif %}
+
+            <!-- Gemini Models -->
+            {% if gemini_models %}
+            <optgroup label="Google Gemini Models">
+            {% for model in gemini_models %}
               <option value="{{ model }}" {% if model == default_model %}selected{% endif %}>{{ model }}</option>
             {% endfor %}
             </optgroup>
@@ -156,6 +173,17 @@ function downloadSummaryCSV() {
 <script>
   var currentActivityId = null;
 
+  function toggleCustomIntent() {
+    var intentSelect = document.getElementById('training-intent');
+    var customContainer = document.getElementById('custom-intent-container');
+
+    if (intentSelect.value === 'custom') {
+      customContainer.style.display = 'block';
+    } else {
+      customContainer.style.display = 'none';
+    }
+  }
+
   function showModeModal(button) {
     // Get activity ID and name from button data attributes
     currentActivityId = button.dataset.activityId;
@@ -164,6 +192,9 @@ function downloadSummaryCSV() {
     // Update modal title
     document.getElementById('modal-activity-name').textContent = activityName;
 
+    // Reset custom intent visibility
+    toggleCustomIntent();
+
     // Show the modal
     var modal = new bootstrap.Modal(document.getElementById('modeModal'));
     modal.show();
@@ -171,7 +202,19 @@ function downloadSummaryCSV() {
 
   function runAnalysis(mode) {
     // Get selected training intent and model
-    var trainingIntent = document.getElementById('training-intent').value;
+    var trainingIntentSelect = document.getElementById('training-intent').value;
+    var trainingIntent = trainingIntentSelect;
+
+    // If custom is selected, use the custom input value
+    if (trainingIntentSelect === 'custom') {
+      var customInput = document.getElementById('custom-intent-input').value.trim();
+      if (!customInput) {
+        alert('Please enter your custom training intent.');
+        return;
+      }
+      trainingIntent = customInput;
+    }
+
     var llmModel = document.getElementById('llm-model').value;
 
     // Hide the modal

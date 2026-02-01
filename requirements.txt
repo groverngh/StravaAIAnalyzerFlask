@@ -3,9 +3,11 @@ requests
 python-dotenv
 groq
 openai
+google-generativeai
 bootstrap-flask
 markdown2
 google-api-python-client
 google-auth
 gunicorn
 playwright
+fitparse

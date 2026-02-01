@@ -4,6 +4,7 @@ import os
 import requests
 import openai  # Re-enabled for hybrid OpenAI + Groq support
 from groq import Groq
+import google.generativeai as genai  # Google Gemini
 from datetime import datetime
 from urllib.parse import urlencode
 import markdown2
@@ -12,6 +13,8 @@ import time
 import threading
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from werkzeug.utils import secure_filename
+from fit_parser import parse_fit_file, validate_fit_file
 
 load_dotenv()
 
@@ -34,21 +37,40 @@ GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 GROQ_DEFAULT_MODEL = os.getenv('GROQ_DEFAULT_MODEL', 'llama-3.3-70b-versatile')
 GROQ_MODELS = os.getenv('GROQ_MODELS', 'llama-3.3-70b-versatile,llama-3.1-70b-versatile,mixtral-8x7b-32768,gemma2-9b-it').split(',')
 
-# Combine all models for dropdown (Groq first, then OpenAI if available)
+# Google Gemini Configuration
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+GEMINI_DEFAULT_MODEL = os.getenv('GEMINI_DEFAULT_MODEL', 'gemini-2.0-flash-exp')
+GEMINI_MODELS = os.getenv('GEMINI_MODELS', 'gemini-2.0-flash-exp,gemini-1.5-pro,gemini-1.5-flash').split(',') if os.getenv('GEMINI_MODELS') else []
+
+# Configure Gemini if API key is available
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+# Combine all models for dropdown (Groq first, then OpenAI, then Gemini if available)
 ALL_MODELS = GROQ_MODELS.copy()
 if OPENAI_MODELS and OPENAI_API_KEY:
     ALL_MODELS.extend(OPENAI_MODELS)
+if GEMINI_MODELS and GEMINI_API_KEY:
+    ALL_MODELS.extend(GEMINI_MODELS)
 
-# Determine overall default model (prefer Groq)
-DEFAULT_MODEL = GROQ_DEFAULT_MODEL if GROQ_API_KEY else (OPENAI_DEFAULT_MODEL if OPENAI_API_KEY else 'llama-3.3-70b-versatile')
+# Determine overall default model (prefer Gemini, then Groq, then OpenAI)
+if GEMINI_API_KEY:
+    DEFAULT_MODEL = GEMINI_DEFAULT_MODEL
+elif GROQ_API_KEY:
+    DEFAULT_MODEL = GROQ_DEFAULT_MODEL
+elif OPENAI_API_KEY:
+    DEFAULT_MODEL = OPENAI_DEFAULT_MODEL
+else:
+    DEFAULT_MODEL = 'llama-3.3-70b-versatile'
 
 STRAVA_CLIENT_ID = os.getenv('STRAVA_CLIENT_ID')
 STRAVA_CLIENT_SECRET = os.getenv('STRAVA_CLIENT_SECRET')
 STRAVA_REDIRECT_URI = os.getenv('STRAVA_REDIRECT_URI', 'http://localhost:4200/callback')
 
-# Rate limiting configuration (separate limits for OpenAI vs Groq)
+# Rate limiting configuration (separate limits for each provider)
 NUM_ANALYSIS_OPENAI = int(os.getenv('NUM_ANALYSIS_OPENAI', '0'))  # 0 = unlimited
 NUM_ANALYSIS_GROQ = int(os.getenv('NUM_ANALYSIS_GROQ', '0'))  # 0 = unlimited
+NUM_ANALYSIS_GEMINI = int(os.getenv('NUM_ANALYSIS_GEMINI', '0'))  # 0 = unlimited
 DEBUG_SKIP_LLM = os.getenv('DEBUG_SKIP_LLM', 'false').lower() == 'true'
 TOKEN_FILE = 'token_store.json'
 GOOGLE_SHEETS_CREDENTIALS_FILE = 'njmaniacs-485422-8e16104bb447.json'
@@ -56,6 +78,18 @@ GOOGLE_SHEET_ID = '1POa75jrHHYwyfBAC0aObgc01HEFPnjl7ongLAJhqfa0'
 GOOGLE_SHEET_NAME = 'Sheet1'
 ATHLETE_CREDS_SHEET_NAME = 'Athelete'
 AI_ANALYSIS_SHEET_NAME = 'AI Analysis'
+
+# FIT file upload configuration
+UPLOAD_FOLDER = 'uploads'
+ALLOWED_EXTENSIONS = {'fit'}
+MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB
+
+# Create upload folder if it doesn't exist
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# Configure Flask app for file uploads
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_SIZE
 
 # Token management functions
 def save_tokens(access_token, refresh_token, expires_at):
@@ -299,10 +333,12 @@ def get_model_provider(model_name):
         model_name (str): Model identifier
 
     Returns:
-        str: 'openai' or 'groq'
+        str: 'openai', 'groq', or 'gemini'
     """
     if model_name in OPENAI_MODELS:
         return 'openai'
+    elif model_name in GEMINI_MODELS:
+        return 'gemini'
     else:
         return 'groq'
 
@@ -322,7 +358,7 @@ def check_analysis_limit(ip_address, provider='groq'):
 
     Args:
         ip_address (str): Client IP address
-        provider (str): 'openai' or 'groq'
+        provider (str): 'openai', 'groq', or 'gemini'
 
     Returns:
         tuple: (allowed (bool), count (int), limit (int))
@@ -330,6 +366,8 @@ def check_analysis_limit(ip_address, provider='groq'):
     # Get the appropriate limit based on provider
     if provider == 'openai':
         limit = NUM_ANALYSIS_OPENAI
+    elif provider == 'gemini':
+        limit = NUM_ANALYSIS_GEMINI
     else:
         limit = NUM_ANALYSIS_GROQ
 
@@ -395,7 +433,7 @@ def log_analysis_request(ip_address, athlete_name=None, activity_id=None, provid
         ip_address (str): Client IP address
         athlete_name (str, optional): Athlete name if logged in
         activity_id (str, optional): Activity ID analyzed
-        provider (str): 'openai' or 'groq'
+        provider (str): 'openai', 'groq', or 'gemini'
         model (str, optional): Specific model used
     """
     try:
@@ -434,6 +472,40 @@ def log_analysis_request(ip_address, athlete_name=None, activity_id=None, provid
     except Exception as e:
         print(f"Error logging analysis request: {e}")
         return False
+
+def strip_activity_data(activity):
+    """Strip out images and unnecessary data from activity JSON to save tokens
+
+    Args:
+        activity (dict): Raw activity data from Strava API
+
+    Returns:
+        dict: Cleaned activity data without images and large unnecessary fields
+    """
+    # Create a copy to avoid modifying the original
+    cleaned_activity = activity.copy()
+
+    # Remove photo/image fields (these waste tokens and aren't useful for analysis)
+    fields_to_remove = [
+        'photos',  # Photo data
+        'total_photo_count',  # Photo count
+        'map',  # Map contains polyline and image URLs - usually very large
+        'segment_efforts',  # Can be very large, not needed for general analysis
+        'best_efforts',  # Can be large
+        'laps',  # Can be large, usually redundant with splits
+        'splits_metric',  # Keep splits_standard (miles), remove metric (km)
+        'athlete',  # Athlete profile data not needed
+        'similar_activities',  # Not needed
+        'device_name',  # Not critical
+        'gear',  # Gear details not critical
+        'average_temp',  # Watch temperature affected by body heat, unreliable
+        'temp',  # Temperature reading, unreliable from watch
+    ]
+
+    for field in fields_to_remove:
+        cleaned_activity.pop(field, None)
+
+    return cleaned_activity
 
 def get_athlete_token(athlete_name):
     """Get valid token for a specific athlete, refreshing if necessary"""
@@ -575,6 +647,7 @@ def fetch_activities():
                          analysis_query=analysis_query,
                          groq_models=GROQ_MODELS,
                          openai_models=OPENAI_MODELS,
+                         gemini_models=GEMINI_MODELS,
                          default_model=DEFAULT_MODEL)
 
 @app.route('/activity/<int:activity_id>', methods=['GET', 'POST'])
@@ -602,6 +675,8 @@ def activity_detail(activity_id):
             # Initialize appropriate client
             if provider == 'openai':
                 llm_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+            elif provider == 'gemini':
+                llm_client = genai.GenerativeModel(DEFAULT_MODEL)
             else:
                 llm_client = Groq(api_key=GROQ_API_KEY)
 
@@ -611,6 +686,7 @@ CRITICAL - STRAVA API DATA FORMAT:
 - ALL distances in the JSON are in METERS (not miles or kilometers)
 - ALL elevations in the JSON are in METERS (not feet)
 - ALL speeds are in METERS PER SECOND (not mph or min/mile)
+- ALL temperatures are in CELSIUS (not Fahrenheit)
 - Times are in SECONDS
 
 REQUIRED CONVERSIONS FOR YOUR ANALYSIS:
@@ -618,16 +694,21 @@ REQUIRED CONVERSIONS FOR YOUR ANALYSIS:
 - Elevation: divide meters by 0.3048 to get feet
 - Pace: (moving_time_seconds / distance_meters) * 26.8224 = minutes per mile
 - Speed: multiply meters/second by 2.23694 to get mph
+- Temperature: (celsius × 9/5) + 32 = Fahrenheit
 
 OUTPUT FORMAT - USE US UNITS:
 - Display all distances in MILES (e.g., "5.2 miles")
 - Display all elevations in FEET (e.g., "450 feet")
 - Display pace in MINUTES PER MILE (e.g., "8:30 min/mi")
+- Display temperatures in FAHRENHEIT (e.g., "72°F")
 - Display splits in miles unless the activity has custom kilometer splits
 
 Provide clear, actionable insights based on properly converted data."""
 
-            prompt = f"Analyze this Strava activity in detail: {activity}"
+            # Strip out images and unnecessary data to save tokens
+            cleaned_activity = strip_activity_data(activity)
+
+            prompt = f"Analyze this Strava activity in detail: {cleaned_activity}"
             if analysis_query:
                 prompt += f"\nFocus on: {analysis_query}"
 
@@ -682,22 +763,29 @@ To make actual API calls, set `DEBUG_SKIP_LLM=false` in your .env file.
 """
                 analysis_html = markdown2.markdown(analysis)
             else:
-                # Call LLM API (OpenAI or Groq)
-                response = llm_client.chat.completions.create(
-                    model=DEFAULT_MODEL,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt}
-                    ]
-                )
+                # Call LLM API (OpenAI, Groq, or Gemini)
+                if provider == 'gemini':
+                    # Gemini API format
+                    full_prompt = f"{system_prompt}\n\n{prompt}"
+                    response = llm_client.generate_content(full_prompt)
+                    analysis = response.text.strip()
+                else:
+                    # OpenAI/Groq API format
+                    response = llm_client.chat.completions.create(
+                        model=DEFAULT_MODEL,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": prompt}
+                        ]
+                    )
+                    analysis = response.choices[0].message.content.strip()
 
-                analysis = response.choices[0].message.content.strip()
                 analysis_html = markdown2.markdown(analysis)
         except Exception as e:
             error = f'LLM API error: {e}'
     return render_template('activity.html', activity=activity, analysis=analysis, analysis_html=analysis_html, error=error)
 
-@app.route('/api/analyze_activity/<int:activity_id>', methods=['POST'])
+@app.route('/api/analyze_activity/<activity_id>', methods=['POST'])
 def api_analyze_activity(activity_id):
     """API endpoint for analyzing a single activity with detailed data"""
     # Get client IP address
@@ -715,6 +803,8 @@ def api_analyze_activity(activity_id):
     # Get the appropriate rate limit for this provider
     if provider == 'openai':
         rate_limit = NUM_ANALYSIS_OPENAI
+    elif provider == 'gemini':
+        rate_limit = NUM_ANALYSIS_GEMINI
     else:
         rate_limit = NUM_ANALYSIS_GROQ
 
@@ -752,28 +842,46 @@ def api_analyze_activity(activity_id):
         # rate_limit=0 means unlimited
         limit = 'unlimited'
 
-    # Check if we're viewing a specific athlete's activities
-    token = session.get('athlete_token')
-    if not token:
-        token = get_token()
-    analysis_query = session.get('analysis_query', '')
-    if not token:
-        return jsonify({'error': 'Not authenticated'}), 401
+    # Check if this is a FIT file activity (ID starts with "fit_")
+    if str(activity_id).startswith('fit_'):
+        # Get FIT activity from session
+        activity = session.get('fit_activity')
+        if not activity:
+            return jsonify({'error': 'FIT file activity not found in session. Please upload the file again.'}), 404
 
-    # Fetch detailed activity data from Strava
-    headers = {'Authorization': f'Bearer {token}'}
-    resp = requests.get(STRAVA_ACTIVITY_DETAIL_URL.format(activity_id), headers=headers)
+        # Get analysis query from session (same as Strava activities)
+        analysis_query = session.get('analysis_query', '')
 
-    if not resp.ok:
-        return jsonify({'error': 'Failed to fetch activity details from Strava'}), 500
+        # FIT activities already have cleaned data structure
+        cleaned_activity = strip_activity_data(activity)
+    else:
+        # This is a Strava activity - fetch from API
+        token = session.get('athlete_token')
+        if not token:
+            token = get_token()
+        analysis_query = session.get('analysis_query', '')
+        if not token:
+            return jsonify({'error': 'Not authenticated'}), 401
 
-    activity = resp.json()
+        # Fetch detailed activity data from Strava
+        headers = {'Authorization': f'Bearer {token}'}
+        resp = requests.get(STRAVA_ACTIVITY_DETAIL_URL.format(activity_id), headers=headers)
 
-    # Analyze with selected provider (OpenAI or Groq)
+        if not resp.ok:
+            return jsonify({'error': 'Failed to fetch activity details from Strava'}), 500
+
+        activity = resp.json()
+
+        # Strip out images and unnecessary data to save tokens
+        cleaned_activity = strip_activity_data(activity)
+
+    # Analyze with selected provider (OpenAI, Groq, or Gemini)
     try:
         # Initialize appropriate client based on provider
         if provider == 'openai':
             llm_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        elif provider == 'gemini':
+            llm_client = genai.GenerativeModel(selected_model)
         else:
             llm_client = Groq(api_key=GROQ_API_KEY)
 
@@ -781,14 +889,15 @@ def api_analyze_activity(activity_id):
         if analysis_mode == 'maniac':
             system_prompt = """You are my over-achieving endurance coach in "maniac mode."
 
-CRITICAL - STRAVA API DATA FORMAT:
+CRITICAL - DATA FORMAT (Strava or FIT file):
 - ALL distances in the JSON are in METERS (not miles or kilometers)
 - ALL elevations in the JSON are in METERS (not feet)
 - ALL speeds are in METERS PER SECOND
+- ALL temperatures are in CELSIUS (not Fahrenheit)
 - Times are in SECONDS
-- CONVERT TO US UNITS: meters ÷ 1609.34 = miles | meters ÷ 0.3048 = feet | (moving_time_sec / distance_m) × 26.8224 = min/mile
+- CONVERT TO US UNITS: meters ÷ 1609.34 = miles | meters ÷ 0.3048 = feet | (moving_time_sec / distance_m) × 26.8224 = min/mile | (celsius × 9/5) + 32 = °F
 
-Analyze this Strava activity with brutal honesty. Assume I want to be faster, stronger, and more disciplined than 99% of athletes.
+Analyze this activity with brutal honesty. Assume I want to be faster, stronger, and more disciplined than 99% of athletes.
 
 Rules:
 - Be blunt, direct, and unsympathetic to excuses
@@ -818,14 +927,15 @@ Do not motivate me emotionally. Fix me."""
         elif analysis_mode == 'nice':
             system_prompt = """You are my supportive endurance coach in "nice guy mode."
 
-CRITICAL - STRAVA API DATA FORMAT:
+CRITICAL - DATA FORMAT (Strava or FIT file):
 - ALL distances in the JSON are in METERS (not miles or kilometers)
 - ALL elevations in the JSON are in METERS (not feet)
 - ALL speeds are in METERS PER SECOND
+- ALL temperatures are in CELSIUS (not Fahrenheit)
 - Times are in SECONDS
-- CONVERT TO US UNITS: meters ÷ 1609.34 = miles | meters ÷ 0.3048 = feet | (moving_time_sec / distance_m) × 26.8224 = min/mile
+- CONVERT TO US UNITS: meters ÷ 1609.34 = miles | meters ÷ 0.3048 = feet | (moving_time_sec / distance_m) × 26.8224 = min/mile | (celsius × 9/5) + 32 = °F
 
-Analyze this Strava activity with a balanced, encouraging, and constructive tone. Assume I am committed and consistent, and I want to improve sustainably.
+Analyze this activity with a balanced, encouraging, and constructive tone. Assume I am committed and consistent, and I want to improve sustainably.
 
 Guidelines:
 - Start with what went well and why it matters
@@ -853,14 +963,15 @@ Keep it honest, but kind."""
         elif analysis_mode == 'nerd':
             system_prompt = """You are my sports science–oriented data analyst in "data nerd mode."
 
-CRITICAL - STRAVA API DATA FORMAT:
+CRITICAL - DATA FORMAT (Strava or FIT file):
 - ALL distances in the JSON are in METERS (not miles or kilometers)
 - ALL elevations in the JSON are in METERS (not feet)
 - ALL speeds are in METERS PER SECOND
+- ALL temperatures are in CELSIUS (not Fahrenheit)
 - Times are in SECONDS
-- CONVERT TO US UNITS: meters ÷ 1609.34 = miles | meters ÷ 0.3048 = feet | (moving_time_sec / distance_m) × 26.8224 = min/mile
+- CONVERT TO US UNITS: meters ÷ 1609.34 = miles | meters ÷ 0.3048 = feet | (moving_time_sec / distance_m) × 26.8224 = min/mile | (celsius × 9/5) + 32 = °F
 
-Analyze this Strava activity purely through data, physiology, and execution quality. Assume I want objective insights, not motivation.
+Analyze this activity purely through data, physiology, and execution quality. Assume I want objective insights, not motivation.
 
 Rules:
 - Be precise, quantitative, and evidence-based
@@ -895,10 +1006,11 @@ Do not coach emotionally. Let the data speak."""
             # Fallback for any unexpected mode
             system_prompt = """You are a fitness data analyst.
 
-CRITICAL - STRAVA API DATA FORMAT:
+CRITICAL - DATA FORMAT (Strava or FIT file):
 - ALL distances in the JSON are in METERS (not miles or kilometers)
 - ALL elevations in the JSON are in METERS (not feet)
 - ALL speeds are in METERS PER SECOND (not mph or min/mile)
+- ALL temperatures are in CELSIUS (not Fahrenheit)
 - Times are in SECONDS
 
 REQUIRED CONVERSIONS FOR YOUR ANALYSIS:
@@ -906,16 +1018,21 @@ REQUIRED CONVERSIONS FOR YOUR ANALYSIS:
 - Elevation: divide meters by 0.3048 to get feet
 - Pace: (moving_time_seconds / distance_meters) * 26.8224 = minutes per mile
 - Speed: multiply meters/second by 2.23694 to get mph
+- Temperature: (celsius × 9/5) + 32 = Fahrenheit
 
 OUTPUT FORMAT - USE US UNITS:
 - Display all distances in MILES (e.g., "5.2 miles")
 - Display all elevations in FEET (e.g., "450 feet")
 - Display pace in MINUTES PER MILE (e.g., "8:30 min/mi")
+- Display temperatures in FAHRENHEIT (e.g., "72°F")
 - Display splits in miles unless the activity has custom kilometer splits
 
 Provide clear, actionable insights based on properly converted data."""
 
-        prompt = f"Analyze this Strava activity in detail: {activity}"
+        # Determine if this is a FIT file or Strava activity for the prompt
+        activity_source = "FIT file activity" if str(activity_id).startswith('fit_') else "Strava activity"
+
+        prompt = f"Analyze this {activity_source} in detail: {cleaned_activity}"
         if training_intent:
             prompt += f"\n\nStated training intent: {training_intent}"
             prompt += "\nEvaluate whether the execution matched the stated training intent."
@@ -977,16 +1094,23 @@ To make actual API calls, set `DEBUG_SKIP_LLM=false` in your .env file.
 """
             analysis_html = markdown2.markdown(analysis)
         else:
-            # Call LLM API (OpenAI or Groq based on selected model)
-            response = llm_client.chat.completions.create(
-                model=selected_model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt}
-                ]
-            )
+            # Call LLM API (OpenAI, Groq, or Gemini based on selected model)
+            if provider == 'gemini':
+                # Gemini API format - combine system and user prompts
+                full_prompt = f"{system_prompt}\n\n{prompt}"
+                response = llm_client.generate_content(full_prompt)
+                analysis = response.text.strip()
+            else:
+                # OpenAI/Groq API format
+                response = llm_client.chat.completions.create(
+                    model=selected_model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                analysis = response.choices[0].message.content.strip()
 
-            analysis = response.choices[0].message.content.strip()
             analysis_html = markdown2.markdown(analysis)
 
         return jsonify({
@@ -1058,6 +1182,8 @@ def analyze_list():
         # Initialize appropriate client
         if provider == 'openai':
             llm_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        elif provider == 'gemini':
+            llm_client = genai.GenerativeModel(DEFAULT_MODEL)
         else:
             llm_client = Groq(api_key=GROQ_API_KEY)
 
@@ -1067,6 +1193,7 @@ CRITICAL - STRAVA API DATA FORMAT:
 - ALL distances in the JSON are in METERS (not miles or kilometers)
 - ALL elevations in the JSON are in METERS (not feet)
 - ALL speeds are in METERS PER SECOND (not mph or min/mile)
+- ALL temperatures are in CELSIUS (not Fahrenheit)
 - Times are in SECONDS
 
 REQUIRED CONVERSIONS FOR YOUR ANALYSIS:
@@ -1074,16 +1201,21 @@ REQUIRED CONVERSIONS FOR YOUR ANALYSIS:
 - Elevation: divide meters by 0.3048 to get feet
 - Pace: (moving_time_seconds / distance_meters) * 26.8224 = minutes per mile
 - Speed: multiply meters/second by 2.23694 to get mph
+- Temperature: (celsius × 9/5) + 32 = Fahrenheit
 
 OUTPUT FORMAT - USE US UNITS:
 - Display all distances in MILES (e.g., "5.2 miles")
 - Display all elevations in FEET (e.g., "450 feet")
 - Display pace in MINUTES PER MILE (e.g., "8:30 min/mi")
+- Display temperatures in FAHRENHEIT (e.g., "72°F")
 - Display splits in miles unless the activity has custom kilometer splits
 
 Provide clear, actionable insights and trends across all activities based on properly converted data."""
 
-        prompt = f"Analyze this list of Strava activities: {activities}"
+        # Strip out images and unnecessary data from each activity to save tokens
+        cleaned_activities = [strip_activity_data(act) for act in activities]
+
+        prompt = f"Analyze this list of Strava activities: {cleaned_activities}"
         if analysis_query:
             prompt += f"\nFocus on: {analysis_query}"
         try:
@@ -1138,16 +1270,23 @@ To make actual API calls, set `DEBUG_SKIP_LLM=false` in your .env file.
 """
                 analysis_html = markdown2.markdown(analysis)
             else:
-                # Call LLM API (OpenAI or Groq)
-                response = llm_client.chat.completions.create(
-                    model=DEFAULT_MODEL,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt}
-                    ]
-                )
+                # Call LLM API (OpenAI, Groq, or Gemini)
+                if provider == 'gemini':
+                    # Gemini API format
+                    full_prompt = f"{system_prompt}\n\n{prompt}"
+                    response = llm_client.generate_content(full_prompt)
+                    analysis = response.text.strip()
+                else:
+                    # OpenAI/Groq API format
+                    response = llm_client.chat.completions.create(
+                        model=DEFAULT_MODEL,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": prompt}
+                        ]
+                    )
+                    analysis = response.choices[0].message.content.strip()
 
-                analysis = response.choices[0].message.content.strip()
                 analysis_html = markdown2.markdown(analysis)
         except Exception as e:
             analysis = f'LLM API error: {e}'
@@ -1258,6 +1397,7 @@ def select_activity():
                              summary=summary,
                              groq_models=GROQ_MODELS,
                              openai_models=OPENAI_MODELS,
+                             gemini_models=GEMINI_MODELS,
                              default_model=DEFAULT_MODEL)
     return redirect(url_for('activity_detail', activity_id=activity_id))
 
@@ -1385,7 +1525,124 @@ def fetch_athlete_activities(athlete_name):
                          athlete_name=athlete_name,
                          groq_models=GROQ_MODELS,
                          openai_models=OPENAI_MODELS,
+                         gemini_models=GEMINI_MODELS,
                          default_model=DEFAULT_MODEL)
+
+@app.route('/athlete/<athlete_name>/upload_fit', methods=['POST'])
+def upload_fit_file(athlete_name):
+    """Handle FIT file upload and convert to activity data for analysis"""
+    # Check if file was uploaded
+    if 'fit_file' not in request.files:
+        athletes_data = get_athletes_data()
+        athlete_summary = next((a for a in athletes_data if a['athlete'] == athlete_name), None)
+        return render_template('athlete_profile.html',
+                             athlete=athlete_summary,
+                             athlete_name=athlete_name,
+                             error='No file uploaded. Please select a FIT file.')
+
+    file = request.files['fit_file']
+    activity_name = request.form.get('activity_name', '').strip()
+
+    # Check if a file was selected
+    if file.filename == '':
+        athletes_data = get_athletes_data()
+        athlete_summary = next((a for a in athletes_data if a['athlete'] == athlete_name), None)
+        return render_template('athlete_profile.html',
+                             athlete=athlete_summary,
+                             athlete_name=athlete_name,
+                             error='No file selected. Please choose a FIT file to upload.')
+
+    # Check file extension
+    if not file.filename.lower().endswith('.fit'):
+        athletes_data = get_athletes_data()
+        athlete_summary = next((a for a in athletes_data if a['athlete'] == athlete_name), None)
+        return render_template('athlete_profile.html',
+                             athlete=athlete_summary,
+                             athlete_name=athlete_name,
+                             error='Invalid file type. Only .fit files are accepted.')
+
+    try:
+        # Save uploaded file temporarily
+        filename = secure_filename(file.filename)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        unique_filename = f"{athlete_name}_{timestamp}_{filename}"
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+        file.save(filepath)
+
+        # Validate FIT file
+        is_valid, error_message = validate_fit_file(filepath)
+        if not is_valid:
+            # Clean up invalid file
+            os.remove(filepath)
+            athletes_data = get_athletes_data()
+            athlete_summary = next((a for a in athletes_data if a['athlete'] == athlete_name), None)
+            return render_template('athlete_profile.html',
+                                 athlete=athlete_summary,
+                                 athlete_name=athlete_name,
+                                 error=f'Invalid FIT file: {error_message}')
+
+        # Parse FIT file
+        activity = parse_fit_file(filepath)
+
+        # Clean up file after parsing
+        os.remove(filepath)
+
+        if not activity:
+            athletes_data = get_athletes_data()
+            athlete_summary = next((a for a in athletes_data if a['athlete'] == athlete_name), None)
+            return render_template('athlete_profile.html',
+                                 athlete=athlete_summary,
+                                 athlete_name=athlete_name,
+                                 error='Failed to parse FIT file. The file may be corrupted or in an unsupported format.')
+
+        # Override activity name if provided
+        if activity_name:
+            activity['name'] = activity_name
+
+        # Convert to Strava-compatible format for display
+        # Add distance_miles and pace_min_per_mile for display compatibility
+        if 'distance' in activity and activity['distance'] > 0:
+            activity['distance_miles'] = round(activity['distance'] / 1609.34, 2)
+            if 'moving_time' in activity and activity['moving_time'] > 0:
+                pace_seconds = activity['moving_time'] / activity['distance_miles']
+                pace_min = int(pace_seconds // 60)
+                pace_sec = int(pace_seconds % 60)
+                activity['pace_min_per_mile'] = f"{pace_min}:{pace_sec:02d}"
+            else:
+                activity['pace_min_per_mile'] = 'N/A'
+        else:
+            activity['distance_miles'] = 0
+            activity['pace_min_per_mile'] = 'N/A'
+
+        # Store in session for analysis
+        session['fit_activity'] = activity
+        session['selected_athlete'] = athlete_name
+
+        # Get athlete summary data
+        athletes_data = get_athletes_data()
+        athlete_summary = next((a for a in athletes_data if a['athlete'] == athlete_name), None)
+
+        # Render profile page with FIT activity ready for analysis
+        return render_template('athlete_profile.html',
+                             athlete=athlete_summary,
+                             athlete_name=athlete_name,
+                             fit_activity=activity,
+                             groq_models=GROQ_MODELS,
+                             openai_models=OPENAI_MODELS,
+                             gemini_models=GEMINI_MODELS,
+                             default_model=DEFAULT_MODEL)
+
+    except Exception as e:
+        # Clean up file if error occurred
+        if os.path.exists(filepath):
+            os.remove(filepath)
+
+        athletes_data = get_athletes_data()
+        athlete_summary = next((a for a in athletes_data if a['athlete'] == athlete_name), None)
+        return render_template('athlete_profile.html',
+                             athlete=athlete_summary,
+                             athlete_name=athlete_name,
+                             error=f'Error processing FIT file: {str(e)}')
 
 if __name__ == '__main__':
     app.run(debug=True, port=4200, host='localhost')
