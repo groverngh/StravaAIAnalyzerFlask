@@ -844,16 +844,37 @@ def api_analyze_activity(activity_id):
 
     # Check if this is a FIT file activity (ID starts with "fit_")
     if str(activity_id).startswith('fit_'):
-        # Get FIT activity from session
-        activity = session.get('fit_activity')
-        if not activity:
+        # Get comprehensive FIT activity from session
+        print(f"[DEBUG] Looking for FIT activity in session...")
+        print(f"[DEBUG] Session keys: {list(session.keys())}")
+
+        comprehensive_data = session.get('fit_activity_comprehensive')
+        print(f"[DEBUG] Got comprehensive_data: {comprehensive_data is not None}")
+
+        if not comprehensive_data:
             return jsonify({'error': 'FIT file activity not found in session. Please upload the file again.'}), 404
 
-        # Get analysis query from session (same as Strava activities)
+        # Get analysis query from session
         analysis_query = session.get('analysis_query', '')
+        print(f"[DEBUG] Preparing data for LLM with {len(comprehensive_data.get('laps', []))} laps")
 
-        # FIT activities already have cleaned data structure
-        cleaned_activity = strip_activity_data(activity)
+        # For FIT files, send comprehensive data to LLM including laps, segments, intervals
+        # This gives the LLM full context about the workout structure
+        # Note: comprehensive_data is now just the strava_format dict
+        cleaned_activity = {
+            'activity_summary': comprehensive_data,
+            'laps': comprehensive_data.get('laps', []),
+            'segments': comprehensive_data.get('segments', []),
+            'gps_track_summary': {
+                'total_points': len(comprehensive_data.get('gps_track', [])),
+                'has_gps': len(comprehensive_data.get('gps_track', [])) > 0
+            },
+            'zones': comprehensive_data.get('zones', {}),
+            'device_info': {
+                'manufacturer': comprehensive_data.get('device_manufacturer'),
+                'model': comprehensive_data.get('device_name')
+            }
+        }
     else:
         # This is a Strava activity - fetch from API
         token = session.get('athlete_token')
@@ -897,6 +918,16 @@ CRITICAL - DATA FORMAT (Strava or FIT file):
 - Times are in SECONDS
 - CONVERT TO US UNITS: meters ÷ 1609.34 = miles | meters ÷ 0.3048 = feet | (moving_time_sec / distance_m) × 26.8224 = min/mile | (celsius × 9/5) + 32 = °F
 
+FIT FILE DATA STRUCTURE (when available):
+- "activity_summary" contains overall metrics
+- "laps" array contains interval/segment data with:
+  - distance, elapsed_time, moving_time for each lap
+  - average_speed, max_speed, average_heartrate, max_heartrate, average_watts, average_cadence
+  - intensity: "active" (work interval) or "rest"/"recovery"
+  - lap_trigger: how the lap was created (manual, distance, time, etc.)
+- "segments" array contains named segments
+- Analyze lap-by-lap data for interval workouts to assess pacing consistency and execution quality
+
 Analyze this activity with brutal honesty. Assume I want to be faster, stronger, and more disciplined than 99% of athletes.
 
 Rules:
@@ -935,6 +966,12 @@ CRITICAL - DATA FORMAT (Strava or FIT file):
 - Times are in SECONDS
 - CONVERT TO US UNITS: meters ÷ 1609.34 = miles | meters ÷ 0.3048 = feet | (moving_time_sec / distance_m) × 26.8224 = min/mile | (celsius × 9/5) + 32 = °F
 
+FIT FILE DATA STRUCTURE (when available):
+- "activity_summary" contains overall metrics
+- "laps" array contains interval/segment data with detailed metrics per lap
+- "segments" array contains named segments
+- Use lap data to analyze pacing consistency and workout structure
+
 Analyze this activity with a balanced, encouraging, and constructive tone. Assume I am committed and consistent, and I want to improve sustainably.
 
 Guidelines:
@@ -970,6 +1007,13 @@ CRITICAL - DATA FORMAT (Strava or FIT file):
 - ALL temperatures are in CELSIUS (not Fahrenheit)
 - Times are in SECONDS
 - CONVERT TO US UNITS: meters ÷ 1609.34 = miles | meters ÷ 0.3048 = feet | (moving_time_sec / distance_m) × 26.8224 = min/mile | (celsius × 9/5) + 32 = °F
+
+FIT FILE DATA STRUCTURE (when available):
+- "activity_summary" contains overall metrics
+- "laps" array contains interval/segment data - USE THIS for detailed interval analysis
+- Calculate coefficient of variation across laps to assess pacing consistency
+- Analyze HR trends across intervals to detect fatigue/cardiac drift
+- Compare work vs recovery intervals when intensity field is available
 
 Analyze this activity purely through data, physiology, and execution quality. Assume I want objective insights, not motivation.
 
@@ -1012,6 +1056,12 @@ CRITICAL - DATA FORMAT (Strava or FIT file):
 - ALL speeds are in METERS PER SECOND (not mph or min/mile)
 - ALL temperatures are in CELSIUS (not Fahrenheit)
 - Times are in SECONDS
+
+FIT FILE DATA STRUCTURE (when available):
+- "activity_summary" contains overall metrics
+- "laps" array contains interval/segment data with detailed per-lap metrics
+- "segments" array contains named segments
+- Use lap data to analyze workout structure and pacing
 
 REQUIRED CONVERSIONS FOR YOUR ANALYSIS:
 - Distance: divide meters by 1609.34 to get miles
@@ -1581,13 +1631,13 @@ def upload_fit_file(athlete_name):
                                  athlete_name=athlete_name,
                                  error=f'Invalid FIT file: {error_message}')
 
-        # Parse FIT file
-        activity = parse_fit_file(filepath)
+        # Parse FIT file with comprehensive data (includes all laps, segments, GPS tracks)
+        comprehensive_data = parse_fit_file(filepath, comprehensive=True)
 
         # Clean up file after parsing
         os.remove(filepath)
 
-        if not activity:
+        if not comprehensive_data:
             athletes_data = get_athletes_data()
             athlete_summary = next((a for a in athletes_data if a['athlete'] == athlete_name), None)
             return render_template('athlete_profile.html',
@@ -1595,28 +1645,78 @@ def upload_fit_file(athlete_name):
                                  athlete_name=athlete_name,
                                  error='Failed to parse FIT file. The file may be corrupted or in an unsupported format.')
 
+        # Extract strava_format for display purposes
+        activity_display = comprehensive_data['strava_format']
+
+        # Debug: Print what we're storing
+        print(f"[DEBUG] Parsed FIT file successfully")
+        print(f"[DEBUG] Activity ID: {activity_display.get('id')}")
+        print(f"[DEBUG] Number of laps: {len(activity_display.get('laps', []))}")
+        print(f"[DEBUG] Number of GPS points: {len(activity_display.get('gps_track', []))}")
+
         # Override activity name if provided
         if activity_name:
-            activity['name'] = activity_name
+            activity_display['name'] = activity_name
+            comprehensive_data['strava_format']['name'] = activity_name
 
-        # Convert to Strava-compatible format for display
         # Add distance_miles and pace_min_per_mile for display compatibility
-        if 'distance' in activity and activity['distance'] > 0:
-            activity['distance_miles'] = round(activity['distance'] / 1609.34, 2)
-            if 'moving_time' in activity and activity['moving_time'] > 0:
-                pace_seconds = activity['moving_time'] / activity['distance_miles']
+        if 'distance' in activity_display and activity_display['distance'] > 0:
+            activity_display['distance_miles'] = round(activity_display['distance'] / 1609.34, 2)
+            if 'moving_time' in activity_display and activity_display['moving_time'] > 0:
+                pace_seconds = activity_display['moving_time'] / activity_display['distance_miles']
                 pace_min = int(pace_seconds // 60)
                 pace_sec = int(pace_seconds % 60)
-                activity['pace_min_per_mile'] = f"{pace_min}:{pace_sec:02d}"
+                activity_display['pace_min_per_mile'] = f"{pace_min}:{pace_sec:02d}"
             else:
-                activity['pace_min_per_mile'] = 'N/A'
+                activity_display['pace_min_per_mile'] = 'N/A'
         else:
-            activity['distance_miles'] = 0
-            activity['pace_min_per_mile'] = 'N/A'
+            activity_display['distance_miles'] = 0
+            activity_display['pace_min_per_mile'] = 'N/A'
 
-        # Store in session for analysis
-        session['fit_activity'] = activity
+        # Store COMPREHENSIVE data in session for LLM analysis
+        # Note: Flask cookie-based sessions have size limits (~4KB)
+        # Create compact version without full GPS track (too large for session cookies)
+        compact_data = {
+            'id': activity_display['id'],
+            'name': activity_display['name'],
+            'type': activity_display['type'],
+            'start_date': activity_display['start_date'],
+            'start_date_local': activity_display['start_date_local'],
+            'distance': activity_display['distance'],
+            'moving_time': activity_display['moving_time'],
+            'elapsed_time': activity_display['elapsed_time'],
+            'total_elevation_gain': activity_display['total_elevation_gain'],
+            'elev_high': activity_display['elev_high'],
+            'elev_low': activity_display['elev_low'],
+            'average_speed': activity_display['average_speed'],
+            'max_speed': activity_display['max_speed'],
+            'average_heartrate': activity_display['average_heartrate'],
+            'max_heartrate': activity_display['max_heartrate'],
+            'average_cadence': activity_display['average_cadence'],
+            'average_watts': activity_display.get('average_watts'),
+            'max_watts': activity_display.get('max_watts'),
+            'weighted_average_watts': activity_display.get('weighted_average_watts'),
+            'average_temp': activity_display.get('average_temp'),
+            'has_heartrate': activity_display['has_heartrate'],
+            'has_power': activity_display.get('has_power', False),
+            'calories': activity_display['calories'],
+            'laps': activity_display.get('laps', []),  # Include all laps
+            'segments': activity_display.get('segments', []),  # Include segments
+            'splits_standard': activity_display.get('splits_standard', []),
+            'splits_metric': activity_display.get('splits_metric', []),
+            'zones': activity_display.get('zones', {}),
+            'device_name': activity_display.get('device_name'),
+            'device_manufacturer': activity_display.get('device_manufacturer'),
+            'gps_track_summary': {  # Summary instead of full GPS track
+                'total_points': len(activity_display.get('gps_track', [])),
+                'has_gps': len(activity_display.get('gps_track', [])) > 0
+            }
+        }
+
+        session['fit_activity_comprehensive'] = compact_data
         session['selected_athlete'] = athlete_name
+        print(f"[DEBUG] Stored compact data in session (no full GPS track)")
+        print(f"[DEBUG] Laps: {len(compact_data['laps'])}, Segments: {len(compact_data['segments'])}")
 
         # Get athlete summary data
         athletes_data = get_athletes_data()
@@ -1626,7 +1726,7 @@ def upload_fit_file(athlete_name):
         return render_template('athlete_profile.html',
                              athlete=athlete_summary,
                              athlete_name=athlete_name,
-                             fit_activity=activity,
+                             fit_activity=activity_display,
                              groq_models=GROQ_MODELS,
                              openai_models=OPENAI_MODELS,
                              gemini_models=GEMINI_MODELS,

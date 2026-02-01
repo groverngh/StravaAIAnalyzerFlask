@@ -105,71 +105,74 @@ document.getElementById('fit-upload-form').addEventListener('submit', function()
             </div>
         </div>
 
-        <!-- Analysis Mode Selection -->
-        <div class="mb-3">
-            <label for="training-intent-fit" class="form-label fw-bold">Training Intent:</label>
-            <select class="form-select" id="training-intent-fit" onchange="toggleCustomIntentFit()">
-                <option value="aerobic base">Aerobic Base</option>
-                <option value="long run">Long Run</option>
-                <option value="race simulation">Race Simulation</option>
-                <option value="recovery">Recovery</option>
-                <option value="threshold">Threshold</option>
-                <option value="custom" selected>Custom</option>
-            </select>
-        </div>
+        <!-- Analysis Form Container (will be hidden during analysis) -->
+        <div id="fit-analysis-form-container">
+            <!-- Analysis Mode Selection -->
+            <div class="mb-3">
+                <label for="training-intent-fit" class="form-label fw-bold">Training Intent:</label>
+                <select class="form-select" id="training-intent-fit" onchange="toggleCustomIntentFit()">
+                    <option value="aerobic base">Aerobic Base</option>
+                    <option value="long run">Long Run</option>
+                    <option value="race simulation">Race Simulation</option>
+                    <option value="recovery">Recovery</option>
+                    <option value="threshold">Threshold</option>
+                    <option value="custom" selected>Custom</option>
+                </select>
+            </div>
 
-        <!-- Custom Training Intent Input (hidden by default) -->
-        <div class="mb-3" id="custom-intent-container-fit" style="display:none;">
-            <label for="custom-intent-input-fit" class="form-label fw-bold">Custom Training Intent:</label>
-            <textarea class="form-control" id="custom-intent-input-fit" rows="3" placeholder="Describe your training goal and what you want the AI to focus on (e.g., 'Negative split practice - analyze pacing strategy and execution')"></textarea>
-            <small class="form-text text-muted">Be specific about your goal and what aspects you want analyzed.</small>
-        </div>
+            <!-- Custom Training Intent Input (hidden by default) -->
+            <div class="mb-3" id="custom-intent-container-fit" style="display:none;">
+                <label for="custom-intent-input-fit" class="form-label fw-bold">Custom Training Intent:</label>
+                <textarea class="form-control" id="custom-intent-input-fit" rows="3" placeholder="Describe your training goal and what you want the AI to focus on (e.g., 'Negative split practice - analyze pacing strategy and execution')"></textarea>
+                <small class="form-text text-muted">Be specific about your goal and what aspects you want analyzed.</small>
+            </div>
 
-         <!-- Model Selection -->
-         <div class="mb-4">
-            <label for="llm-model" class="form-label fw-bold">AI Model:</label>
-            <select class="form-select" id="llm-model">
-              <!-- Groq Models -->
-              {% if groq_models %}
-              <optgroup label="Groq Models">
-              {% for model in groq_models %}
-                <option value="{{ model }}" {% if model == default_model %}selected{% endif %}>{{ model }}</option>
-              {% endfor %}
-              </optgroup>
-              {% endif %}
-  
-              <!-- OpenAI Models -->
-              {% if openai_models %}
-              <optgroup label="OpenAI Models">
-              {% for model in openai_models %}
-                <option value="{{ model }}" {% if model == default_model %}selected{% endif %}>{{ model }}</option>
-              {% endfor %}
-              </optgroup>
-              {% endif %}
-  
-              <!-- Gemini Models -->
-              {% if gemini_models %}
-              <optgroup label="Google Gemini Models">
-              {% for model in gemini_models %}
-                <option value="{{ model }}" {% if model == default_model %}selected{% endif %}>{{ model }}</option>
-              {% endfor %}
-              </optgroup>
-              {% endif %}
-            </select>
-          </div>
+             <!-- Model Selection -->
+             <div class="mb-4">
+                <label for="llm-model" class="form-label fw-bold">AI Model:</label>
+                <select class="form-select" id="llm-model">
+                  <!-- Groq Models -->
+                  {% if groq_models %}
+                  <optgroup label="Groq Models">
+                  {% for model in groq_models %}
+                    <option value="{{ model }}" {% if model == default_model %}selected{% endif %}>{{ model }}</option>
+                  {% endfor %}
+                  </optgroup>
+                  {% endif %}
 
-        <div class="mb-3">
-            <label class="form-label fw-bold">Select Analysis Mode:</label>
-            <div class="d-grid gap-2">
-                <button type="button" class="btn btn-outline-secondary" onclick="analyzeFitActivity('nerd')">
-                    <strong>Nerd Mode 🤓</strong> - Data-driven analysis
-                </button>
-                <button type="button" class="btn btn-outline-danger" onclick="analyzeFitActivity('maniac')">
-                    <strong>Maniac Mode 🔥</strong> - Brutal honesty
-                </button>
-                <button type="button" class="btn btn-outline-success" onclick="analyzeFitActivity('nice')">
-                    <strong>Nice Coach Mode 😊</strong> - Supportive feedback
-                </button>
+                  <!-- OpenAI Models -->
+                  {% if openai_models %}
+                  <optgroup label="OpenAI Models">
+                  {% for model in openai_models %}
+                    <option value="{{ model }}" {% if model == default_model %}selected{% endif %}>{{ model }}</option>
+                  {% endfor %}
+                  </optgroup>
+                  {% endif %}
+
+                  <!-- Gemini Models -->
+                  {% if gemini_models %}
+                  <optgroup label="Google Gemini Models">
+                  {% for model in gemini_models %}
+                    <option value="{{ model }}" {% if model == default_model %}selected{% endif %}>{{ model }}</option>
+                  {% endfor %}
+                  </optgroup>
+                  {% endif %}
+                </select>
+              </div>
+
+            <div class="mb-3">
+                <label class="form-label fw-bold">Select Analysis Mode:</label>
+                <div class="d-grid gap-2">
+                    <button type="button" class="btn btn-outline-secondary" onclick="analyzeFitActivity('nerd')">
+                        <strong>Nerd Mode 🤓</strong> - Data-driven analysis
+                    </button>
+                    <button type="button" class="btn btn-outline-danger" onclick="analyzeFitActivity('maniac')">
+                        <strong>Maniac Mode 🔥</strong> - Brutal honesty
+                    </button>
+                    <button type="button" class="btn btn-outline-success" onclick="analyzeFitActivity('nice')">
+                        <strong>Nice Coach Mode 😊</strong> - Supportive feedback
+                    </button>
+                </div>
             </div>
         </div>
 
@@ -204,6 +207,12 @@ var currentActivityId = null;
     }
   }
 
+  function showFitAnalysisForm() {
+    // Show the form again and hide results
+    document.getElementById('fit-analysis-form-container').style.display = 'block';
+    document.getElementById('fit-analysis-results').style.display = 'none';
+  }
+
 function analyzeFitActivity(mode) {
     // Get selected training intent and model
     var trainingIntentSelect = document.getElementById('training-intent-fit').value;
@@ -221,10 +230,17 @@ function analyzeFitActivity(mode) {
 
     var activityId = '{{ fit_activity.id }}';
 
+    // Validate activity ID
+    if (!activityId || activityId === '') {
+      alert('Error: Activity ID is missing. Please re-upload your FIT file.');
+      return;
+    }
+
     //read the model
     var llmModel = document.getElementById('llm-model').value;
 
-    // Show loading spinner
+    // Hide form and show loading spinner
+    document.getElementById('fit-analysis-form-container').style.display = 'none';
     document.getElementById('fit-loading').style.display = 'block';
     document.getElementById('fit-analysis-results').style.display = 'none';
 
@@ -246,23 +262,27 @@ function analyzeFitActivity(mode) {
         document.getElementById('fit-loading').style.display = 'none';
 
         if (data.error) {
-            // Show error
+            // Show error and re-show form
             document.getElementById('fit-analysis-content').innerHTML =
                 '<div class="alert alert-danger">' + data.error + '</div>';
             document.getElementById('fit-analysis-results').style.display = 'block';
+            document.getElementById('fit-analysis-form-container').style.display = 'block';
         } else if (data.success) {
-            // Show analysis results
-            document.getElementById('fit-analysis-content').innerHTML = data.analysis_html;
+            // Show analysis results with "Analyze Again" button
+            document.getElementById('fit-analysis-content').innerHTML =
+                '<button class="btn btn-sm btn-secondary mb-3" onclick="showFitAnalysisForm()">← Analyze Again</button>' +
+                data.analysis_html;
             document.getElementById('fit-analysis-results').style.display = 'block';
         }
     })
     .catch(error => {
-        // Hide loading spinner
+        // Hide loading spinner and re-show form
         document.getElementById('fit-loading').style.display = 'none';
         // Show error
         document.getElementById('fit-analysis-content').innerHTML =
             '<div class="alert alert-danger">Error: ' + error.message + '</div>';
         document.getElementById('fit-analysis-results').style.display = 'block';
+        document.getElementById('fit-analysis-form-container').style.display = 'block';
     });
 }
 
